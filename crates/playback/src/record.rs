@@ -31,6 +31,7 @@ const RING_SECONDS: usize = 4;
 const STALL: Duration = Duration::from_secs(2);
 const GONE: u8 = 1;
 const BROKEN: u8 = 2;
+const WRITER_FAILED: &str = "The take writer stopped unexpectedly. Recorded files have been kept for recovery.";
 
 /// Why the input can't go on.
 #[derive(Debug, Clone, PartialEq)]
@@ -289,6 +290,9 @@ impl Recorder {
         if let Some(e) = self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
             return Some(Trouble::Disk(e));
         }
+        if self.shared.armed.load(Ordering::Acquire) && self.writer.as_ref().is_some_and(|(writer, _)| writer.is_finished()) {
+            return Some(Trouble::Disk(WRITER_FAILED.into()));
+        }
         let name = &self.device_name;
         match self.shared.fault.load(Ordering::Relaxed) {
             GONE => return Some(Trouble::Device(format!("“{name}” was disconnected"))),
@@ -302,18 +306,30 @@ impl Recorder {
         (self.seen.1.elapsed() >= STALL).then(|| Trouble::Device(format!("“{name}” stopped sending audio")))
     }
 
-    /// Input the current take has lost to a slow disk so far, in milliseconds.
+    /// Interleaved input samples the current take lost to a full capture ring. Unlike
+    /// `lost_ms`, this reports even a single lost sample, so a host can stop a damaged take
+    /// immediately on its next control-thread poll.
+    pub fn lost_samples(&self) -> usize {
+        self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Input the current take has lost to a slow disk so far, in whole milliseconds.
     pub fn lost_ms(&self) -> u64 {
-        let frames = self.shared.dropped.load(Ordering::Relaxed) / self.channels.max(1);
+        let frames = self.lost_samples() / self.channels.max(1);
         (frames as u64).saturating_mul(1000) / u64::from(self.sample_rate.max(1))
     }
 
     pub fn finish(&mut self) -> Takes {
         self.shared.armed.store(false, Ordering::Release);
-        let (takes, problem) = self.writer.take().and_then(|(w, _)| w.join().ok()).unwrap_or_default();
-        let lost = self.shared.dropped.swap(0, Ordering::Relaxed) / self.channels.max(1);
-        let slow =
-            (lost > 0).then(|| format!("{} ms of input lost: the disk was too slow", lost.saturating_mul(1000) / self.sample_rate.max(1) as usize));
+        let (takes, problem) = match self.writer.take() {
+            Some((writer, _)) => writer.join().unwrap_or_else(|_| (Vec::new(), Some(WRITER_FAILED.into()))),
+            None => (Vec::new(), None),
+        };
+        let lost = self.shared.dropped.swap(0, Ordering::Relaxed);
+        let slow = (lost > 0).then(|| {
+            let ms = lost as f64 * 1000.0 / self.channels.max(1) as f64 / f64::from(self.sample_rate.max(1));
+            format!("{ms:.3} ms of input lost ({lost} samples): the disk was too slow")
+        });
         (takes, problem.or(slow))
     }
 }
@@ -455,6 +471,31 @@ mod tests {
     }
 
     #[test]
+    fn overflow_is_visible_below_one_millisecond_and_finish_keeps_the_usable_take() {
+        for (channels, samples, kept_frames, lost) in [(1, 10, 8, 2), (3, 9, 2, 1)] {
+            let dir = std::env::temp_dir().join(format!("soundcraft-overflow-take-{}-{channels}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox.wav"), 48_000).unwrap();
+            let shared = Arc::new(Shared::new(CaptureRing::new(8)));
+            shared.armed.store(true, Ordering::Release);
+            shared.capture(&vec![0.25; samples], &mut 0);
+            let mut r = recorder(&shared);
+            r.channels = channels;
+            assert_eq!(r.lost_ms(), 0, "whole milliseconds cannot detect this loss");
+            assert_eq!(r.lost_samples(), lost, "even a fraction of an interleaved frame must be reported");
+            let sh = Arc::clone(&shared);
+            let writer = std::thread::spawn(move || write_takes(&sh, vec![take], channels));
+            r.writer = Some((writer, Vec::new()));
+            let (takes, warning) = r.finish();
+            assert_eq!(takes.len(), 1, "overflow must not discard the valid prefix");
+            assert_eq!(decode(&takes[0].1), vec![vec![0.25; kept_frames]]);
+            assert!(warning.is_some_and(|text| text.contains(&format!("({lost} samples)"))), "finish reports the exact loss");
+            assert_eq!(r.lost_samples(), 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn nan_and_infinite_input_records_as_silence() {
         let shared = Shared::new(CaptureRing::new(8));
         let (mut owed, mut out) = (0, Vec::new());
@@ -520,6 +561,37 @@ mod tests {
         assert_eq!(r.trouble(), None, "reported once");
         shared.armed.store(false, Ordering::Release);
         assert!(writer.join().unwrap().1.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crashed_writer_is_reported_and_its_partial_file_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-crashed-writer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox.wav"), 48_000).unwrap();
+        take.write(&[0.25; 32], 1);
+        take.write_header();
+        let shared = Arc::new(Shared::new(CaptureRing::new(64)));
+        shared.armed.store(true, Ordering::Release);
+        let mut r = recorder(&shared);
+        let writer = std::thread::spawn(move || {
+            drop(take);
+            std::panic::panic_any("simulated writer failure")
+        });
+        // Wait for the thread to terminate without joining it, as the live control poll does.
+        for _ in 0..1_000 {
+            if writer.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(writer.is_finished());
+        r.writer = Some((writer, Vec::new()));
+        assert_eq!(r.trouble(), Some(Trouble::Disk(WRITER_FAILED.into())));
+        let (takes, problem) = r.finish();
+        assert!(takes.is_empty(), "a crashed worker cannot return its completed-take list");
+        assert_eq!(problem.as_deref(), Some(WRITER_FAILED));
+        assert_eq!(decode(&dir.join("Vox.wav")), vec![vec![0.25; 32]], "journal recovery can still use the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

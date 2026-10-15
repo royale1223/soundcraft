@@ -175,6 +175,8 @@ struct AudioState {
     looped: Option<Range>,
     /// Rendered frames waiting to be consumed (planar, main channels) and the fractional read index.
     pending: Vec<Vec<f32>>,
+    /// Active channel count within the fixed-capacity `pending` workspace.
+    pending_channels: usize,
     /// Stereo fold-down gains per main channel (used when the device has fewer channels).
     fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
@@ -201,6 +203,11 @@ impl AudioState {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64, garbage: SyncSender<Vec<Box<dyn Plugin>>>) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
+        // Construct the initial routing, strip buffers and meter storage before the device stream
+        // starts invoking this state. The output workspace covers every supported main layout so
+        // later format changes only alter its active channel count.
+        let mut mix = new_engine(sr);
+        mix.ensure_synced(&session);
         AudioState {
             garbage,
             old_sessions: None,
@@ -210,13 +217,14 @@ impl AudioState {
             fold: fold_gains(&session),
             rx,
             shared,
-            mix: new_engine(sr),
+            mix,
             session,
             pos: 0,
             playing: false,
             end: None,
             looped: None,
-            pending: vec![vec![0.0; BLOCK]; nch],
+            pending: (0..MAX_CHANNELS).map(|_| vec![0.0; BLOCK]).collect(),
+            pending_channels: nch,
             pending_len: 0,
             read: 0.0,
             device_rate,
@@ -273,8 +281,8 @@ impl AudioState {
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
                     let nch = main_channels(&s);
-                    if self.pending.len() != nch {
-                        self.pending = vec![vec![0.0; BLOCK]; nch];
+                    if self.pending_channels != nch {
+                        self.pending_channels = nch;
                         self.pending_len = 0;
                         self.read = 0.0;
                     }
@@ -362,7 +370,7 @@ impl AudioState {
     fn render_next(&mut self, quantum: usize) {
         let mut n = quantum.clamp(1, BLOCK);
         if self.pending_garbage.is_some() {
-            for channel in &mut self.pending {
+            for channel in &mut self.pending[..self.pending_channels] {
                 channel[..n].fill(0.0);
             }
             self.pending_len = n;
@@ -386,7 +394,7 @@ impl AudioState {
             }
         }
         if n == 0 {
-            for c in &mut self.pending {
+            for c in &mut self.pending[..self.pending_channels] {
                 c.iter_mut().for_each(|x| *x = 0.0);
             }
             self.pending_len = BLOCK;
@@ -401,7 +409,7 @@ impl AudioState {
         }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
-        self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.mix.render(&self.session, self.pos, n, &mut self.pending[..self.pending_channels]);
         self.send_garbage();
         self.pending_len = n;
         publish_mix_meters(&self.shared, &self.mix.main_meter, &self.mix.meters);
@@ -444,7 +452,7 @@ impl AudioState {
             let i0 = self.read.floor() as usize;
             let fr = (self.read - i0 as f64) as f32;
             let sounding = self.playing || monitoring;
-            let nch = self.pending.len();
+            let nch = self.pending_channels;
             let sample = |c: usize| {
                 let ch = self.pending.get(c);
                 let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
@@ -1345,6 +1353,26 @@ mod tests {
     }
 
     #[test]
+    fn initial_session_is_synchronized_before_the_callback_starts() {
+        let mut session = soundcraft_model::Session::default();
+        let track = session.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        let session = Arc::new(session);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (_tx, rx) = channel();
+        let state = AudioState::new(rx, shared, Arc::clone(&session), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        assert!(state.mix.meters.contains_key(&track));
+        assert_eq!(state.mix.meters[&track].peaks.len(), 1);
+        assert_eq!(state.pending.len(), MAX_CHANNELS);
+        assert_eq!(state.pending_channels, main_channels(&session));
+        assert!(state.pending.iter().all(|channel| channel.len() == BLOCK));
+    }
+
+    #[test]
     fn short_device_callbacks_render_short_mix_blocks() {
         let s = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
@@ -1379,11 +1407,20 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        let initial = Arc::new(soundcraft_model::Session::default());
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&initial), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        let (old_tx, old_rx) = sync_channel(OLD_SESSIONS);
+        tx.send(Cmd::OldSessions(old_tx)).unwrap();
+        tx.send(Cmd::Session(Arc::clone(&s), Vec::new())).unwrap();
+        assert_eq!(st.pending.len(), MAX_CHANNELS);
+        let pending_capacity: Vec<usize> = st.pending.iter().map(Vec::capacity).collect();
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         // An 8-channel device: channels in order, the rest silent.
         let mut out = vec![0.0f32; 8 * 256];
         st.fill(&mut out, 8);
+        assert_eq!(st.pending_channels, 6);
+        assert_eq!(st.pending.iter().map(Vec::capacity).collect::<Vec<_>>(), pending_capacity);
+        assert!(old_rx.try_recv().is_ok());
         let f = &out[8 * 100..8 * 101];
         for c in 0..6 {
             assert!((f[c] - 0.1 * (c + 1) as f32).abs() < 1e-5, "{f:?}");

@@ -547,6 +547,12 @@ impl MixEngine {
     pub fn sync(&mut self, s: &Session) {
         let mb = self.max_block;
         let main_ch = main_channels(s);
+        if self.work.capacity() < s.tracks.len() {
+            self.work.reserve(s.tracks.len().saturating_sub(self.work.len()));
+        }
+        if self.aux_fed.capacity() < s.tracks.len() {
+            self.aux_fed.reserve(s.tracks.len().saturating_sub(self.aux_fed.len()));
+        }
         self.main_fmt = s.main_format();
         if self.main.len() != main_ch {
             self.main = vec![vec![0.0; mb]; main_ch];
@@ -563,9 +569,17 @@ impl MixEngine {
         }
         for t in &s.tracks {
             let ch = strip_channels(t, main_ch);
+            let meter_channels = if t.kind == TrackKind::Master { main_ch } else { ch };
+            let meter = self.meters.entry(t.id).or_default();
+            if meter.peaks.len() != meter_channels {
+                meter.peaks.resize(meter_channels, 0.0);
+            }
             let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
+            }
+            if strip.scratch.len() < mb {
+                strip.scratch.resize(mb, 0.0);
             }
             while strip.plugins.len() > t.mixer.inserts.len() {
                 let p = strip.plugins.pop().flatten();
@@ -3114,6 +3128,35 @@ mod tests {
         assert_eq!(meter.map_or([1.0; 2], |m| m.peak), [0.0; 2]);
         assert!(meter.is_some_and(|m| m.peaks.iter().all(|peak| *peak == 0.0)));
         assert_eq!(meter.map_or(0, |m| m.peaks.capacity()), capacity);
+    }
+
+    #[test]
+    fn sync_prepares_render_workspaces_before_render() {
+        let (session, track) = session_with_dc(0.5, 4800);
+        let mut engine = MixEngine::new(48_000.0, 512);
+        engine.ensure_synced(&session);
+        let meter = engine.meters.get(&track).expect("sync creates track meters");
+        assert_eq!(meter.peaks.len(), 1);
+        let capacity = meter.peaks.capacity();
+        let map_capacity = engine.meters.capacity();
+        let work_capacity = engine.work.capacity();
+        let order_capacity = engine.order.capacity();
+        let aux_fed_capacity = engine.aux_fed.capacity();
+        let scratch_capacity = engine.strips[&track].scratch.capacity();
+        assert!(work_capacity >= session.tracks.len());
+        assert!(engine.strips[&track].scratch.len() >= engine.max_block);
+
+        let mut output = vec![vec![0.0; 512]; 2];
+        engine.render(&session, 0, 512, &mut output);
+
+        let meter = engine.meters.get(&track).expect("render keeps track meter");
+        assert_eq!(meter.peaks.capacity(), capacity);
+        assert_eq!(engine.meters.capacity(), map_capacity);
+        assert_eq!(engine.work.capacity(), work_capacity);
+        assert_eq!(engine.order.capacity(), order_capacity);
+        assert_eq!(engine.aux_fed.capacity(), aux_fed_capacity);
+        assert_eq!(engine.strips[&track].scratch.capacity(), scratch_capacity);
+        assert!(meter.peak[0] > 0.0);
     }
 
     #[test]

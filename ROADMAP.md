@@ -122,7 +122,8 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
-- **2026-10-15 (downstream LiteDAW feasibility patch; not an upstream release):** Desktop plugin hosts and video are feature-gated, mobile mix builds select serial rendering, and playback callback work is bounded for command draining and object retirement. Regression coverage also fixes playlist ordering after fade deletion and avoids callback allocations for input scratch buffers and prepared meter snapshots. Full `cargo +1.95.0 xtask ci` passes with `CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1`. The local patch does not change SoundCraft parity/readiness estimates and needs a reachable mobile fork before another repository can pin it.
+- **2026-10-15 (capture-loss diagnostics):** `Recorder::lost_samples` exposes exact interleaved sample loss for hosts that stop damaged takes promptly. Finalization now warns even when loss is smaller than a millisecond or one input frame. A terminated writer is reported both during capture and at finalization, with its partial file left for recovery. Simulated full-ring and worker-failure regressions preserve the valid WAV prefix. No physical-device or parity/readiness claim.
+- **2026-10-15 (downstream LiteDAW feasibility patch; not an upstream release):** Desktop plugin hosts and video are feature-gated, mobile mix builds select serial rendering, and playback callback work is bounded for command draining and object retirement. Regression coverage also fixes playlist ordering after fade deletion and avoids callback allocations for input scratch buffers, prepared meter snapshots, and output buffers when the session changes channel layout. The initial playback session now synchronizes routing, strips, per-track meter storage, scratch buffers, work-list capacity, and auxiliary-route capacity on the stream-construction thread before callbacks begin. Structural updates after startup still synchronize on the callback and remain an open realtime gate. Full `cargo +1.95.0 xtask ci` passes with `CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1`. The local patch does not change SoundCraft parity/readiness estimates and needs a reachable mobile fork before another repository can pin it.
 - **2026-10-13:** `mix.instrument` takes the built-in instrument's parameters in `params` (validated, clamped) and refuses any other field, so a synth setting written beside `plugin` is an error instead of being accepted and ignored (#265)
 - **2026-10-13:** A bounce of a bus that an aux returns onto lines up with the timeline: the aux insert's lookahead is compensated like the main mix's (it left the bus late and cut the end off), and tracks routed to that bus wait for it too (#246)
 - **2026-10-13:** Delay compensation covers the inserts of the master faders: a bounce of the main mix with a Maximizer on the master lines up with the same mix without it (it came out 71 samples late) (#351)
@@ -156,7 +157,10 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | trivial | Expose exact capture loss and retain a warning for sub-millisecond/sub-frame overflow |
 | 2026-10-15 | minor | Local downstream mobile-feasibility patch; no parity estimates changed |
+| 2026-10-15 | trivial | Preallocate playback output channels before callbacks; verify session layout changes preserve workspace |
+| 2026-10-15 | trivial | Pre-sync initial playback session and reserve render workspaces before callbacks |
 | 2026-10-13 | trivial | Progress log: mix.instrument params, unknown fields refused (#265) |
 | 2026-10-13 | trivial | Progress log: bus bounce compensates aux returns (#246) |
 | 2026-10-13 | trivial | Progress log: master insert latency compensated (#351) |
