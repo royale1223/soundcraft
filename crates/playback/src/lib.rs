@@ -140,6 +140,7 @@ struct Shared {
     playing: AtomicBool,
     /// Speed × 1000.
     speed: AtomicU32,
+    output_clip_events: AtomicU32,
     meters: Mutex<MeterSnapshot>,
 }
 
@@ -698,6 +699,7 @@ impl Player {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -965,6 +967,13 @@ impl Player {
         self.shared.playing.load(Ordering::Relaxed)
     }
 
+    /// Counts master blocks reaching digital full scale. Updated before best-effort meter
+    /// publishing, so UI polling or meter-lock contention cannot hide an overload.
+    /// Wraps only after 2^32 overloaded blocks; a new Player starts at zero.
+    pub fn output_clip_events(&self) -> u32 {
+        self.shared.output_clip_events.load(Ordering::Relaxed)
+    }
+
     pub fn meters(&self) -> MeterSnapshot {
         self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
@@ -989,6 +998,9 @@ fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
 /// snapshot can occur briefly while session updates cross the callback; skip them rather than
 /// allocating a new map entry on the audio thread.
 fn publish_mix_meters(shared: &Shared, main: &StripMeter, tracks: &HashMap<TrackId, StripMeter>) {
+    if main.peaks.iter().any(|peak| peak.is_finite() && *peak >= 1.0) {
+        shared.output_clip_events.fetch_add(1, Ordering::Relaxed);
+    }
     if let Ok(mut meters) = shared.meters.try_lock() {
         meters.main.copy_from(main);
         for (id, source) in tracks {
@@ -1234,6 +1246,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let mut source = HashMap::new();
@@ -1253,6 +1266,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         };
 
@@ -1275,6 +1289,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let fault = Fault::default();
@@ -1316,6 +1331,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1334,6 +1350,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1350,12 +1367,35 @@ mod tests {
     }
 
     #[test]
+    fn output_overload_survives_meter_contention_and_later_quiet_blocks() {
+        let shared = Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
+            meters: Mutex::new(MeterSnapshot::default()),
+        };
+        let guard = shared.meters.lock().unwrap();
+        let mut main = StripMeter { peaks: vec![0.25, 1.1], ..Default::default() };
+        publish_mix_meters(&shared, &main, &HashMap::new());
+        assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 1);
+        main.peaks.fill(0.0);
+        publish_mix_meters(&shared, &main, &HashMap::new());
+        assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 1);
+        main.peaks[0] = 1.0;
+        publish_mix_meters(&shared, &main, &HashMap::new());
+        assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 2);
+        drop(guard);
+    }
+
+    #[test]
     fn one_session_update_is_applied_per_callback_drain() {
         let initial = Arc::new(soundcraft_model::Session::default());
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1380,6 +1420,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1414,6 +1455,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1443,6 +1485,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1474,6 +1517,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1492,6 +1536,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1517,6 +1562,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1560,6 +1606,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1655,6 +1702,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1684,6 +1732,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1719,6 +1768,7 @@ mod tests {
                 position: AtomicI64::new(0),
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
+                output_clip_events: AtomicU32::new(0),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             let (tx, rx) = test_channel();
@@ -1749,6 +1799,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &s);
@@ -1790,6 +1841,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -1852,6 +1904,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
@@ -1889,6 +1942,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1951,6 +2005,7 @@ mod tests {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -2046,6 +2101,7 @@ mod tests {
                 position: AtomicI64::new(0),
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
+                output_clip_events: AtomicU32::new(0),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             prepare_meter_layout(&shared, &session);

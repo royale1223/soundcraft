@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (bounces of a bus fed by an aux compensate its latency (#246); previously minor: audio device, rate and buffer choice; ASIO feature) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (downstream master overload telemetry; device readiness unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
 SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the absence of
@@ -68,10 +68,22 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 | Freeze / commit to save CPU | ✅ | 🟡 | `track.commit` renders; `track.freeze` only sets a flag (no CPU saved) |
 | GPU-accelerated UI | — | ✅ (wgpu/glow via eframe) | llvmpipe X11 issue #107 |
 
+## Downstream master overload telemetry
+
+`Player::output_clip_events` counts rendered master blocks whose finite sample
+peak reaches digital full scale. The callback updates an atomic before trying
+its best-effort meter lock. Consumers can retain a reset baseline, so a short
+overload is not lost between UI polls or when the meter snapshot is contended.
+The count survives quiet blocks/session edits for that Player and starts over
+with a new Player. It describes the master mix before device folding; it is not
+oversampled true peak, ADC overload detection or a hardware measurement. No
+allocation, logging or lock is added to the callback for the count.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Downstream callback-side master overload counter; regression covers meter contention and quiet blocks; physical readiness unchanged |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |
 | 2026-10-12 | minor | Audio device settings: system, output, input, sample rate and buffer size; opt-in ASIO |
 | 2026-10-10 | major | Created: audit of audio interface, MIDI, control-surface, sync and performance support against Pro Tools 2026.4.1 |
