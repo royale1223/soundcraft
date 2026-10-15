@@ -524,3 +524,21 @@ fn lofi_quantizes() {
     levels.dedup();
     assert!(levels.len() <= 5, "{levels:?}");
 }
+
+#[test]
+fn declared_latency_bounds_cover_builtin_parameter_ranges() {
+    for rate in [44_100.0, 48_000.0, 96_000.0] {
+        for info in plugins() {
+            let mut plugin = create(info.id).unwrap();
+            plugin.prepare(rate, BLOCK, 2);
+            let maximum = plugin.max_latency();
+            assert!(plugin.latency() <= maximum, "{} at {rate}", info.id);
+            for param in info.params {
+                for value in [param.min, param.max, param.default] {
+                    plugin.set_param(param.id, value);
+                    assert!(plugin.latency() <= maximum, "{} {}={value} at {rate} exceeds prepared bound {maximum}", info.id, param.id);
+                }
+            }
+        }
+    }
+}

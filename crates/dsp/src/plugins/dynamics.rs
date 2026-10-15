@@ -193,6 +193,10 @@ impl Plugin for Compressor {
         self.lookahead
     }
 
+    fn max_latency(&self) -> usize {
+        self.delay.first().map_or(0, |line| line.max_delay() as usize)
+    }
+
     fn gain_reduction_db(&self) -> f32 {
         self.gr_meter
     }

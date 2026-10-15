@@ -1792,6 +1792,8 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
+        prepare_meter_layout(&shared, &session);
+        let fault = Fault::default();
         let (tx, rx) = channel();
         let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
         tx.send(Cmd::OldSessions(old_tx)).unwrap();
@@ -1804,11 +1806,16 @@ mod tests {
         for block in 0..80 {
             let mut prepared_address = None;
             let mut old_address = None;
-            if [12, 24, 36, 48].contains(&block) {
+            if [12, 24, 36, 48, 60].contains(&block) {
                 if block < 48 {
                     session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-                } else {
+                    if block == 24 {
+                        session.track_mut(latent).unwrap().mixer.inserts[1] = Some(Insert::new("compressor"));
+                    }
+                } else if block == 48 {
                     session.track_mut(vocal).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("mix".into(), 30.0);
+                } else {
+                    session.tracks.retain(|track| track.id != latent);
                 }
                 prepare_meter_layout(&shared, &session);
                 let command = session_command(Arc::new(session.clone()), Vec::new(), block * 128);
@@ -1818,7 +1825,11 @@ mod tests {
                 old_address = Some(std::ptr::from_ref(state.mix.as_ref()));
                 tx.send(command).unwrap();
             }
-            state.fill(&mut output, 2);
+            let allocations = allocation_counter::measure(|| {
+                guarded_block(&fault, &shared, &mut output, |out| state.fill(out, 2));
+            });
+            assert_eq!(allocations.count_total, 0, "callback allocated at block {block}: {allocations:?}");
+            assert_eq!(allocations.count_current, 0, "callback freed objects at block {block}: {allocations:?}");
             reference.render(&session, block * 128, 128, &mut expected);
             for (i, frame) in output.chunks_exact(2).enumerate() {
                 assert_eq!(frame, &[expected[0][i].clamp(-1.0, 1.0), expected[1][i].clamp(-1.0, 1.0)], "block {block}");
@@ -1912,5 +1923,76 @@ mod tests {
             drop(old);
         }
         assert_eq!(Arc::strong_count(&second), 1);
+    }
+
+    #[cfg(not(feature = "plugin-hosts"))]
+    #[test]
+    fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
+        use soundcraft_model::{AutoParam, ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackKind};
+        let mut session = Session::default();
+        session.edit.click = false;
+        let source = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let signal = (0..4096).map(|n| (n as f32 * 0.13).sin() * 0.2).collect();
+        session
+            .pool
+            .insert(SourceId(1), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+        let clip = session.new_clip_id();
+        session.track_mut(source).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip, "signal", SourceId(1), 0, 0, 4096));
+        let latent = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let track = session.track_mut(latent).unwrap();
+        let mut compressor = Insert::new("compressor");
+        compressor.params.insert("lookahead".into(), 0.0);
+        track.mixer.inserts[0] = Some(compressor);
+        let lane = track.lane_mut(&AutoParam::Plugin { slot: 0, param: "lookahead".into() });
+        for (pos, value) in [(0, 0.0), (128, 10.0), (256, 0.0), (512, 10.0), (768, 0.0)] {
+            lane.set_point(pos, value);
+        }
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        prepare_meter_layout(&shared, &session);
+        let (tx, rx) = channel();
+        let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
+        tx.send(Cmd::OldSessions(old_tx)).unwrap();
+        let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let fault = Fault::default();
+        let mut output = vec![0.0; 256];
+        let mut expected = vec![vec![0.0; 128]; 2];
+        let mut reference = MixEngine::new(48_000.0, BLOCK);
+        let mut audible = false;
+        for block in 0..8 {
+            if block == 1 {
+                let track = session.track_mut(latent).unwrap();
+                let mut compressor = Insert::new("compressor");
+                compressor.params.insert("lookahead".into(), 0.0);
+                track.mixer.inserts[1] = Some(compressor);
+                let lane = track.lane_mut(&AutoParam::Plugin { slot: 1, param: "lookahead".into() });
+                for (pos, value) in [(0, 0.0), (128, 0.0), (256, 10.0), (512, 10.0), (768, 0.0)] {
+                    lane.set_point(pos, value);
+                }
+                prepare_meter_layout(&shared, &session);
+                // An ordered update can be prepared before the audio callback reaches it.
+                // At position zero both latencies are zero, but their combined future maximum
+                // exceeds the old graph's capacity. Handoff must keep the larger new storage.
+                tx.send(session_command(Arc::new(session.clone()), Vec::new(), 0)).unwrap();
+            }
+            let allocations = allocation_counter::measure(|| guarded_block(&fault, &shared, &mut output, |out| state.fill(out, 2)));
+            reference.render(&session, block as i64 * 128, 128, &mut expected);
+            for (i, frame) in output.chunks_exact(2).enumerate() {
+                assert_eq!(frame, &[expected[0][i], expected[1][i]], "automated delay PCM differs at block {block}");
+            }
+            audible |= output.iter().any(|v| v.abs() > 1e-6);
+            assert_eq!(state.mix.latency, [0, 480, 480, 720, 960, 480, 0, 0][block]);
+            assert_eq!(allocations.count_total, 0, "latency automation allocated at block {block}: {allocations:?}");
+            assert_eq!(allocations.count_current, 0, "latency automation freed objects at block {block}: {allocations:?}");
+            while let Ok(old) = old_rx.try_recv() {
+                drop(old);
+            }
+        }
+        assert!(audible, "automation regression must render actual source audio");
     }
 }

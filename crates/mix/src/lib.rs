@@ -283,7 +283,20 @@ impl DelayLine {
         if len != self.len || self.bufs.len() != ch {
             self.len = len;
             self.idx = 0;
-            self.bufs = vec![vec![0.0; len]; ch];
+            self.bufs.resize_with(ch, Vec::new);
+            for buffer in &mut self.bufs {
+                buffer.resize(len, 0.0);
+                buffer.fill(0.0);
+            }
+        }
+    }
+    /// Reserve the worst prepared latency while retaining the current active delay/history.
+    #[cfg(not(feature = "plugin-hosts"))]
+    fn reserve(&mut self, len: usize, ch: usize) {
+        let len = len.min(MAX_LATENCY);
+        self.bufs.resize_with(ch, Vec::new);
+        for buffer in &mut self.bufs {
+            buffer.reserve(len.saturating_sub(buffer.len()));
         }
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
@@ -718,7 +731,10 @@ impl MixEngine {
                 st.scratch.resize(self.max_block, 0.0);
             }
         }
-        let busses = std::mem::take(&mut self.busses);
+        // Clone the existing hasher rather than constructing a fresh RandomState on the
+        // callback thread (which can initialize that thread's random seed on first use).
+        let empty_busses = HashMap::with_hasher(self.busses.hasher().clone());
+        let busses = std::mem::replace(&mut self.busses, empty_busses);
         let live_input = self.input.get(..self.input_channels.min(self.input.len())).unwrap_or(&[]);
         let live_in = LiveInput { input: live_input, monitor_only: self.monitor_only, recording: self.recording };
         run_strips(&mut work, |(i, st)| {

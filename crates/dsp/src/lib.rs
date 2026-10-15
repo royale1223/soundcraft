@@ -205,6 +205,12 @@ pub trait Plugin: Send {
     fn latency(&self) -> usize {
         0
     }
+    /// Maximum latency this prepared instance can report as parameters change. Fixed-latency
+    /// processors can use the default. Variable-latency processors must override this so a
+    /// realtime host can reserve compensation storage outside its audio callback.
+    fn max_latency(&self) -> usize {
+        self.latency()
+    }
     /// How long the output keeps ringing after the input stops, in samples.
     fn tail_samples(&self) -> usize {
         0

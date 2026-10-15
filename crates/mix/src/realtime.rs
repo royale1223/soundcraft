@@ -6,8 +6,9 @@ impl MixEngine {
     /// the parameters at `pos`. A disposable silent probe resolves plugin latency without
     /// advancing the real instances' smoothers, oscillators, filters, or effect tails.
     ///
-    /// This allocates, constructs DSP, and temporarily holds a second mixer. Dynamic latency
-    /// automation after `pos` still needs a separate capacity policy. Do not call in a callback.
+    /// This allocates, constructs DSP, and temporarily holds a second mixer. Compensation
+    /// reserves each processor's declared maximum latency, including future automation.
+    /// Do not call in a callback.
     pub fn prepare_realtime(&mut self, session: &Session, pos: Samples) {
         self.ensure_synced(session);
         let mut probe = MixEngine::new(self.sample_rate, self.max_block);
@@ -31,15 +32,32 @@ impl MixEngine {
         self.latency = probe.latency;
         self.track_latency = probe.track_latency;
         self.aux_latency = probe.aux_latency;
+        let mut max_track = 0;
+        let mut max_aux = 0;
+        for track in &session.tracks {
+            let Some(strip) = self.strips.get(&track.id) else { continue };
+            let maximum = strip.plugins.iter().flatten().fold(0usize, |sum, slot| sum.saturating_add(slot.plugin.max_latency())).min(MAX_LATENCY);
+            match track.kind {
+                TrackKind::Aux | TrackKind::Folder => max_aux = max_aux.max(maximum),
+                TrackKind::Master | TrackKind::Vca => {}
+                _ => max_track = max_track.max(maximum),
+            }
+        }
+        for strip in self.strips.values_mut() {
+            let channels = strip.buf.len();
+            strip.align.reserve(max_track.max(max_aux), channels);
+            strip.align_pre.reserve(max_track, channels);
+            strip.out_extra.reserve(max_aux, channels);
+        }
     }
 
-    /// Move compatible live DSP state into an independently prepared replacement. This only
-    /// swaps ownership and copies scalar state; it does not allocate, destroy plugins, or resize
-    /// containers. The caller must retire `previous` on a control thread after the handoff.
+    /// Move compatible live DSP state into an independently prepared replacement. This swaps
+    /// ownership or copies into already prepared storage; it never allocates or destroys plugins.
+    /// The caller must retire `previous` on a control thread after the handoff.
     ///
-    /// Channel/rate/block-size changes start fresh where state is incompatible. Unchanged
-    /// compensation delays retain their ring histories. New/changed delays retain the prepared
-    /// zeroed storage. Clip-effect chains are not transferred by this method yet.
+    /// Channel/rate/block-size changes start fresh where state is incompatible. Compensation
+    /// keeps its live history when it fits the new prepared capacity, copying into larger
+    /// prepared storage when needed. Clip-effect chains are not transferred here yet.
     pub fn inherit_runtime(&mut self, previous: &mut Self) {
         if self.sample_rate != previous.sample_rate || self.max_block != previous.max_block {
             return;
@@ -67,8 +85,22 @@ impl MixEngine {
             for (delay, old) in
                 [(&mut strip.align, &mut old.align), (&mut strip.align_pre, &mut old.align_pre), (&mut strip.out_extra, &mut old.out_extra)]
             {
-                if delay.len == old.len && delay.bufs.len() == old.bufs.len() {
+                if delay.bufs.len() != old.bufs.len() || delay.bufs.iter().any(|buffer| buffer.capacity() < old.len) {
+                    continue;
+                }
+                if old.bufs.iter().zip(&delay.bufs).all(|(old, next)| old.capacity() >= next.capacity()) {
                     std::mem::swap(delay, old);
+                } else {
+                    // Keep the larger prepared capacity; swapping in smaller old rings would
+                    // reintroduce a callback allocation when later automation needs it.
+                    delay.len = old.len;
+                    delay.idx = old.idx;
+                    for (next, old) in delay.bufs.iter_mut().zip(&old.bufs) {
+                        next.resize(delay.len, 0.0);
+                        if let Some(history) = old.get(..delay.len) {
+                            next.copy_from_slice(history);
+                        }
+                    }
                 }
             }
         }
@@ -136,7 +168,7 @@ mod tests {
 
     #[test]
     fn prepared_replacements_retain_reverb_tails_delays_and_parameter_smoothing() {
-        let (mut session, vocal, _) = session();
+        let (mut session, vocal, latent) = session();
         let mut live = MixEngine::new(48_000.0, 512);
         live.prepare_realtime(&session, 0);
         let mut reference = MixEngine::new(48_000.0, 512);
@@ -147,6 +179,9 @@ mod tests {
             if [12, 24, 36, 48].contains(&block) {
                 if block < 48 {
                     session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+                    if block == 24 {
+                        session.track_mut(latent).unwrap().mixer.inserts[1] = Some(Insert::new("compressor"));
+                    }
                 } else {
                     session.track_mut(vocal).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("mix".into(), 30.0);
                 }
@@ -154,12 +189,12 @@ mod tests {
                 next.prepare_realtime(&session, block * 512);
                 let new_layout = next.synced;
                 let old_plugin = std::ptr::from_ref(live.strips[&vocal].plugins[0].as_ref().unwrap().plugin.as_ref());
-                let old_delay = live.strips[&vocal].align.bufs[0].as_ptr();
+                let required_delay_capacity = next.strips[&vocal].align.bufs[0].capacity();
                 let prepared_buffer = next.strips[&vocal].buf[0].as_ptr();
                 next.inherit_runtime(&mut live);
                 assert_eq!(next.synced, new_layout);
                 assert!(std::ptr::eq(old_plugin, std::ptr::from_ref(next.strips[&vocal].plugins[0].as_ref().unwrap().plugin.as_ref())));
-                assert_eq!(next.strips[&vocal].align.bufs[0].as_ptr(), old_delay);
+                assert!(next.strips[&vocal].align.bufs[0].capacity() >= required_delay_capacity);
                 assert_eq!(next.strips[&vocal].buf[0].as_ptr(), prepared_buffer);
                 assert_eq!(next.last_end, block * 512);
                 live = next;
