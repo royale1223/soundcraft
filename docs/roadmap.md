@@ -18,8 +18,11 @@ nonzero delay changes may allocate, and physical-device deadlines are unmeasured
 The built-in-only mixer also exposes fresh-layout compensation preparation and
 runtime ownership transfer. Exact host PCM regressions preserve reverb tails,
 compensation histories, and parameter smoothing across structural edits. Replaced
-instances remain in the retired engine. This API is not connected to playback
-yet: ordered bounded delivery and retirement must land together. Probe preparation
+instances remain in the retired engine. Built-in-only playback now connects that API through bounded command and
+retirement rings. Structural session changes prepare on the control thread;
+whole old mixers/snapshots and replaced input rings retire there. Full return
+rings defer later commands without overwriting owned state. Command overflow
+silences output and latches a diagnostic for control-thread recovery. Probe preparation
 temporarily holds another mixer; its control-thread cost is unmeasured. Dynamic
 latency automation and clip-effect state transfer remain open.
 
@@ -105,6 +108,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Connect mobile handoff with bounded ordered rings and overload diagnostics |
 | 2026-10-15 | minor | Add prepared mixer handoff evidence and outstanding integration gates |
 | 2026-10-15 | minor | Record downstream first-render preparation and remaining callback gates |
 | 2026-10-10 | minor | Added the alpha gate (3 of 6 core workflows fail → pre-alpha) |

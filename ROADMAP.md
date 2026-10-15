@@ -122,6 +122,8 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
+- **2026-10-15 (bounded mobile playback handoff):** Built-in-only playback prepares replacement mixers and static compensation storage on the control thread, transfers compatible live DSP state, and returns whole old mixers/snapshots through a fixed-capacity SPSC retirement ring. The command ring holds eight entries and the retirement ring four; callback draining remains bounded and ordered. Overload silences output and reports a fault for control-thread recovery. Replaced input rings use the same retirement path; backpressure retains ownership without overwriting it. Host regressions exercise actual AudioState handoffs, PCM/tail continuity, overload, producer-lock independence, and saturated retirement. Dynamic latency/clip-effect preparation and physical callback measurements remain open. Hosted playback retains its existing preparation path.
+
 - **2026-10-15 (prepared mixer state handoff):** The built-in-only mixer now exposes control-thread delay preparation and an ownership-only runtime-state transfer between independently prepared layouts. Reverb tails, unchanged delay histories, parameter smoothing, and compatible instrument state can survive replacement; spare/removed objects remain owned by the old mixer for control-thread retirement. Five host regressions verify exact PCM across edits, initial-path parity, parameter identity changes, rate incompatibility, and deferred plugin destruction. Playback integration with bounded ordered delivery is still pending; dynamic latency automation and clip-effect state transfer remain open. No realtime or device gate is closed.
 
 - **2026-10-15 (render workspace preparation):** Synchronization now prepares main-meter channels, send/output buffers, zero-delay channel storage, and parameter caches before the first render. Empty plugin adoption preserves that prepared layout. Parameter-name changes invalidate caches even when the parameter count and numeric values match; value-only edits preserve caches and plugin state. Host mobile-feature tests verify buffer retention, parameter application, and first-block sample parity. Structural session updates and nonzero latency changes still need callback-safe preparation; no realtime or device gate is closed.
@@ -161,6 +163,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Connect bounded mobile session handoff and retire whole mixer/input ownership |
 | 2026-10-15 | minor | Add built-in prepared-mixer state handoff with tail and retirement regressions |
 | 2026-10-15 | minor | Prepare render caches and channel storage before the first block; track parameter identities |
 | 2026-10-15 | trivial | Expose exact capture loss and retain a warning for sub-millisecond/sub-frame overflow |

@@ -21,6 +21,7 @@ soundcraft-mix = { path = "../mix", default-features = false }
 soundcraft-dsp.workspace = true
 log.workspace = true
 serde.workspace = true
+rtrb = "=0.4.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true

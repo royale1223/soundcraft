@@ -22,18 +22,70 @@
 //! through handles taken from each instance before it leaves ([`Player::open_editor`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(not(feature = "plugin-hosts"))]
+mod control;
 pub mod devices;
 pub mod record;
 
 pub use devices::AudioConfig;
 
+#[cfg(not(feature = "plugin-hosts"))]
+use control::{Receiver, ReturnReceiver, ReturnSender, Sender, channel, return_channel};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+#[cfg(feature = "plugin-hosts")]
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver as MpscReceiver, SyncSender, sync_channel};
+#[cfg(feature = "plugin-hosts")]
+struct ReturnSender<T>(SyncSender<T>);
+#[cfg(feature = "plugin-hosts")]
+struct ReturnReceiver<T>(MpscReceiver<T>);
+#[cfg(feature = "plugin-hosts")]
+fn return_channel<T>(capacity: usize) -> (ReturnSender<T>, ReturnReceiver<T>) {
+    let (tx, rx) = sync_channel(capacity);
+    (ReturnSender(tx), ReturnReceiver(rx))
+}
+#[cfg(feature = "plugin-hosts")]
+impl<T> ReturnSender<T> {
+    fn try_send(&mut self, value: T) -> Result<(), std::sync::mpsc::TrySendError<T>> {
+        self.0.try_send(value)
+    }
+}
+#[cfg(feature = "plugin-hosts")]
+impl<T> ReturnReceiver<T> {
+    fn try_recv(&mut self) -> Result<T, std::sync::mpsc::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+#[cfg(feature = "plugin-hosts")]
+type SessionMixer = Vec<PreparedInstance>;
+#[cfg(not(feature = "plugin-hosts"))]
+type SessionMixer = Box<MixEngine>;
+
+struct RetiredSession {
+    _session: Option<Arc<Session>>,
+    _mix: Option<Box<MixEngine>>,
+    _input: Option<Arc<record::InputRing>>,
+}
+
+fn session_command(s: Arc<Session>, instances: Vec<PreparedInstance>, pos: Samples) -> Cmd {
+    #[cfg(feature = "plugin-hosts")]
+    {
+        let _ = pos;
+        Cmd::Session(s, instances)
+    }
+    #[cfg(not(feature = "plugin-hosts"))]
+    {
+        let _ = instances;
+        let mut mix = Box::new(new_engine(s.sample_rate.as_f64() as f32));
+        mix.prepare_realtime(&s, pos);
+        Cmd::Session(s, mix)
+    }
+}
 use std::sync::{Arc, Mutex, PoisonError};
 
 const BLOCK: usize = 512;
@@ -44,8 +96,11 @@ const MAX_CONTROL_COMMANDS_PER_CALLBACK: usize = 16;
 /// the batch and temporarily render silence until the UI has room to collect it.
 const RETIRED_PLUGINS: usize = 16;
 
-/// Room for replaced snapshots on their way back; `update_session` empties it before each send.
+/// Room for replaced snapshots/mixers/input rings; `update_session` collects them before sending.
+#[cfg(feature = "plugin-hosts")]
 const OLD_SESSIONS: usize = 16;
+#[cfg(not(feature = "plugin-hosts"))]
+const OLD_SESSIONS: usize = 4;
 
 /// The realtime audio thread marker lives in the mix engine, which carries it into the strips it
 /// renders on worker threads; the cpal callbacks here set it.
@@ -66,9 +121,9 @@ pub type EditorEdit = (TrackId, usize, String, f32);
 
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
-    Session(Arc<Session>, Vec<PreparedInstance>),
+    Session(Arc<Session>, SessionMixer),
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
-    OldSessions(SyncSender<Arc<Session>>),
+    OldSessions(ReturnSender<RetiredSession>),
     Input(Arc<record::InputRing>),
     Recording(bool),
     Play {
@@ -97,6 +152,9 @@ pub enum OutputTrouble {
     Gone,
     /// The device stopped asking for audio while playing.
     Stalled,
+    /// The bounded mobile command queue filled; output stays silent until reconnection.
+    #[cfg(not(feature = "plugin-hosts"))]
+    Overloaded,
 }
 
 /// How the audio output is doing, for the UI.
@@ -161,14 +219,14 @@ struct AudioState {
     /// A second session command is held until the next callback so only one structural sync runs
     /// during any single device block.
     deferred: Option<Cmd>,
-    /// A replaced session that could not fit in the bounded return queue stays owned here instead
-    /// of being destroyed by the audio callback when the UI has not collected retired sessions.
-    pending_old_session: Option<Arc<Session>>,
+    /// Replaced state that cannot fit in the return ring stays owned here. Further commands
+    /// wait for retirement capacity so another update can never overwrite and destroy it.
+    pending_old_session: Option<RetiredSession>,
     /// A retired plugin batch that could not fit in the bounded return queue stays owned here.
     pending_garbage: Option<Vec<Box<dyn Plugin>>>,
     shared: Arc<Shared>,
     session: Arc<Session>,
-    mix: MixEngine,
+    mix: Box<MixEngine>,
     pos: Samples,
     playing: bool,
     end: Option<Samples>,
@@ -186,7 +244,7 @@ struct AudioState {
     recording: bool,
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: SyncSender<Vec<Box<dyn Plugin>>>,
-    old_sessions: Option<SyncSender<Arc<Session>>>,
+    old_sessions: Option<ReturnSender<RetiredSession>>,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -206,8 +264,11 @@ impl AudioState {
         // Construct the initial routing, strip buffers and meter storage before the device stream
         // starts invoking this state. The output workspace covers every supported main layout so
         // later format changes only alter its active channel count.
-        let mut mix = new_engine(sr);
+        let mut mix = Box::new(new_engine(sr));
+        #[cfg(feature = "plugin-hosts")]
         mix.ensure_synced(&session);
+        #[cfg(not(feature = "plugin-hosts"))]
+        mix.prepare_realtime(&session, 0);
         AudioState {
             garbage,
             old_sessions: None,
@@ -239,7 +300,7 @@ impl AudioState {
             return;
         }
         if let Some(old) = self.pending_old_session.take() {
-            if let Some(tx) = &self.old_sessions {
+            if let Some(tx) = &mut self.old_sessions {
                 match tx.try_send(old) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(old) | std::sync::mpsc::TrySendError::Disconnected(old)) => {
@@ -269,16 +330,30 @@ impl AudioState {
             }
             drained += 1;
             match c {
-                Cmd::Input(r) => self.input = Some(r),
+                Cmd::Input(r) => {
+                    if let Some(old) = self.input.replace(r) {
+                        self.retire_state(RetiredSession { _session: None, _mix: None, _input: Some(old) });
+                    }
+                }
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
                     session_updates += 1;
                     changed = true;
-                    if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
-                        let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
-                        self.queue_garbage(old.drain_plugins());
-                    }
-                    self.mix.adopt(instances);
+                    #[cfg(feature = "plugin-hosts")]
+                    let retired_mix = {
+                        if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
+                            let mut old = std::mem::replace(&mut self.mix, Box::new(new_engine(s.sample_rate.as_f64() as f32)));
+                            self.queue_garbage(old.drain_plugins());
+                        }
+                        self.mix.adopt(instances);
+                        None
+                    };
+                    #[cfg(not(feature = "plugin-hosts"))]
+                    let retired_mix = {
+                        let mut prepared = instances;
+                        prepared.inherit_runtime(&mut self.mix);
+                        Some(std::mem::replace(&mut self.mix, prepared))
+                    };
                     // The main format changed (a document edit, not steady state): resize.
                     let nch = main_channels(&s);
                     if self.pending_channels != nch {
@@ -287,17 +362,8 @@ impl AudioState {
                         self.read = 0.0;
                     }
                     self.fold = fold_gains(&s);
-                    let old = std::mem::replace(&mut self.session, s);
-                    if let Some(tx) = &self.old_sessions {
-                        match tx.try_send(old) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::TrySendError::Full(old) | std::sync::mpsc::TrySendError::Disconnected(old)) => {
-                                self.pending_old_session = Some(old);
-                            }
-                        }
-                    } else {
-                        self.pending_old_session = Some(old);
-                    }
+                    let old = RetiredSession { _session: Some(std::mem::replace(&mut self.session, s)), _mix: retired_mix, _input: None };
+                    self.retire_state(old);
                 }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
@@ -322,7 +388,13 @@ impl AudioState {
                     self.mix.reset();
                 }
             }
+            if self.pending_old_session.is_some() {
+                break;
+            }
         }
+        #[cfg(not(feature = "plugin-hosts"))]
+        let _ = changed;
+        #[cfg(feature = "plugin-hosts")]
         if changed {
             // Place adopted instances now (not only once playback starts), so editors see them;
             // `sync` creates no third-party plugins here.
@@ -330,6 +402,19 @@ impl AudioState {
         }
         self.send_garbage();
         self.shared.playing.store(self.playing, Ordering::Relaxed);
+    }
+
+    fn retire_state(&mut self, old: RetiredSession) {
+        if let Some(tx) = &mut self.old_sessions {
+            match tx.try_send(old) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(old) | std::sync::mpsc::TrySendError::Disconnected(old)) => {
+                    self.pending_old_session = Some(old);
+                }
+            }
+        } else {
+            self.pending_old_session = Some(old);
+        }
     }
 
     fn send_garbage(&mut self) {
@@ -421,6 +506,13 @@ impl AudioState {
 
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
+        #[cfg(not(feature = "plugin-hosts"))]
+        if self.rx.overflowed() {
+            self.playing = false;
+            self.shared.playing.store(false, Ordering::Relaxed);
+            out.fill(0.0);
+            return;
+        }
         self.drain();
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
@@ -500,12 +592,12 @@ struct Side {
     /// Instances that refused their stored state: saves keep that state until the plugin's editor
     /// is opened.
     refused: HashSet<(TrackId, usize)>,
-    garbage: Receiver<Vec<Box<dyn Plugin>>>,
-    old_sessions: Option<Receiver<Arc<Session>>>,
+    garbage: MpscReceiver<Vec<Box<dyn Plugin>>>,
+    old_sessions: Option<ReturnReceiver<RetiredSession>>,
 }
 
 impl Side {
-    fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
+    fn new(rate: f32, garbage: MpscReceiver<Vec<Box<dyn Plugin>>>) -> Side {
         Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
     }
 
@@ -518,13 +610,15 @@ impl Side {
                 drop(p);
             }
         }
-        if let Some(rx) = &self.old_sessions {
-            rx.try_iter().for_each(drop);
+        if let Some(rx) = &mut self.old_sessions {
+            while let Ok(old) = rx.try_recv() {
+                drop(old);
+            }
         }
     }
 
     fn return_old_sessions(&mut self, tx: &Sender<Cmd>) {
-        let (otx, orx) = sync_channel(OLD_SESSIONS);
+        let (otx, orx) = return_channel(OLD_SESSIONS);
         self.old_sessions = Some(orx);
         let _ = tx.send(Cmd::OldSessions(otx));
     }
@@ -581,6 +675,10 @@ impl Player {
     /// What stopped the audio output, once: a bug in the engine, or the device went away or
     /// stopped asking for audio while playing.
     pub fn trouble(&self) -> Option<OutputTrouble> {
+        #[cfg(not(feature = "plugin-hosts"))]
+        if self.tx.overflowed() && !self.fault.reported.swap(true, Ordering::Relaxed) {
+            return Some(OutputTrouble::Overloaded);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let stalled = {
             let playing = self.shared.playing.load(Ordering::Relaxed) && !self.silent;
@@ -606,7 +704,7 @@ impl Player {
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
-        let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
+        let new_side = |garbage: MpscReceiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
             Ok((device, config, format, name)) => {
                 // The chosen buffer size first; if the device refuses it, its default.
@@ -756,12 +854,13 @@ impl Player {
         }
     }
 
-    /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
-    /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
+    /// Send a session from the control thread. Hosted builds prepare new third-party instances;
+    /// built-in-only builds prepare the whole replacement mixer and its compensation storage.
+    /// A full mobile command ring latches an output fault rather than silently losing edits.
     pub fn update_session(&self, s: Arc<Session>) {
         let instances = self.side().prepare(&s);
         prepare_meter_layout(&self.shared, &s);
-        let _ = self.tx.send(Cmd::Session(s, instances));
+        let _ = self.tx.send(session_command(s, instances, self.position()));
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.
@@ -1097,6 +1196,20 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
 
 #[cfg(test)]
 mod tests {
+    fn test_channel<T>() -> (super::Sender<T>, super::Receiver<T>) {
+        #[cfg(feature = "plugin-hosts")]
+        {
+            super::channel()
+        }
+        #[cfg(not(feature = "plugin-hosts"))]
+        {
+            super::control::channel_with_capacity(128)
+        }
+    }
+    fn test_session(s: std::sync::Arc<soundcraft_model::Session>, instances: Vec<soundcraft_mix::PreparedInstance>) -> super::Cmd {
+        super::session_command(s, instances, 0)
+    }
+
     use super::*;
 
     #[test]
@@ -1205,7 +1318,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         tx.send(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
         let mut out = vec![0.0f32; 4096];
@@ -1223,7 +1336,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut state = AudioState::new(rx, shared, session, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         for _ in 0..MAX_CONTROL_COMMANDS_PER_CALLBACK + 1 {
             tx.send(Cmd::Recording(true)).unwrap();
@@ -1245,13 +1358,13 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
-        let (session_tx, _session_rx) = sync_channel(OLD_SESSIONS);
+        let (tx, rx) = test_channel();
+        let (session_tx, _session_rx) = return_channel(OLD_SESSIONS);
         tx.send(Cmd::OldSessions(session_tx)).unwrap();
         let mut state = AudioState::new(rx, shared, initial, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         for name in ["first", "second", "third"] {
             let session = soundcraft_model::Session { name: name.into(), ..Default::default() };
-            tx.send(Cmd::Session(Arc::new(session), Vec::new())).unwrap();
+            tx.send(test_session(Arc::new(session), Vec::new())).unwrap();
         }
 
         for expected in ["first", "second", "third"] {
@@ -1269,22 +1382,22 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
-        let (retire_tx, retire_rx) = sync_channel(OLD_SESSIONS);
+        let (tx, rx) = test_channel();
+        let (mut retire_tx, mut retire_rx) = return_channel(OLD_SESSIONS);
         for _ in 0..OLD_SESSIONS {
-            let _ = retire_tx.try_send(Arc::new(soundcraft_model::Session::default()));
+            let _ = retire_tx.try_send(RetiredSession { _session: Some(Arc::new(soundcraft_model::Session::default())), _mix: None, _input: None });
         }
         tx.send(Cmd::OldSessions(retire_tx)).unwrap();
         let mut state = AudioState::new(rx, shared, Arc::clone(&initial), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
 
         let first = Arc::new(soundcraft_model::Session { name: "first".into(), ..Default::default() });
-        tx.send(Cmd::Session(Arc::clone(&first), Vec::new())).unwrap();
+        tx.send(test_session(Arc::clone(&first), Vec::new())).unwrap();
         state.drain();
         assert_eq!(state.session.name, "first");
         assert_eq!(Arc::strong_count(&initial), 2, "the pending retirement still owns the old snapshot");
 
         let second = Arc::new(soundcraft_model::Session { name: "second".into(), ..Default::default() });
-        tx.send(Cmd::Session(Arc::clone(&second), Vec::new())).unwrap();
+        tx.send(test_session(Arc::clone(&second), Vec::new())).unwrap();
         state.drain();
         assert_eq!(state.session.name, "first", "a full retirement queue defers another session update");
 
@@ -1303,7 +1416,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (_tx, rx) = channel();
+        let (_tx, rx) = test_channel();
         let (garbage_tx, garbage_rx) = sync_channel(1);
         let mut state = AudioState::new(rx, Arc::clone(&shared), session, 48_000.0, garbage_tx);
         // Occupy the sole return slot, then retire a real DSP instance.
@@ -1332,7 +1445,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut state = AudioState::new(rx, shared, s, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         let lengths = state.mix.input.iter().map(Vec::len).collect::<Vec<_>>();
         let capacities = state.mix.input.iter().map(Vec::capacity).collect::<Vec<_>>();
@@ -1363,7 +1476,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (_tx, rx) = channel();
+        let (_tx, rx) = test_channel();
         let state = AudioState::new(rx, shared, Arc::clone(&session), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         assert!(state.mix.meters.contains_key(&track));
         assert_eq!(state.mix.meters[&track].peaks.len(), 1);
@@ -1381,7 +1494,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         let mut out = vec![0.0f32; 2 * 64];
@@ -1406,12 +1519,12 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let initial = Arc::new(soundcraft_model::Session::default());
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&initial), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
-        let (old_tx, old_rx) = sync_channel(OLD_SESSIONS);
+        let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
         tx.send(Cmd::OldSessions(old_tx)).unwrap();
-        tx.send(Cmd::Session(Arc::clone(&s), Vec::new())).unwrap();
+        tx.send(test_session(Arc::clone(&s), Vec::new())).unwrap();
         assert_eq!(st.pending.len(), MAX_CHANNELS);
         let pending_capacity: Vec<usize> = st.pending.iter().map(Vec::capacity).collect();
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
@@ -1449,22 +1562,22 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
-        let (session_tx, _session_rx) = sync_channel(OLD_SESSIONS);
+        let (session_tx, _session_rx) = return_channel(OLD_SESSIONS);
         tx.send(Cmd::OldSessions(session_tx)).unwrap();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
         let plugin = soundcraft_dsp::create("gain").unwrap();
-        tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
+        tx.send(test_session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
         let mut out = vec![0.0f32; 256];
         st.fill(&mut out, 2);
         assert!(grx.try_recv().is_err(), "nothing retired yet");
         // A session without the insert retires the instance to the return channel.
-        tx.send(Cmd::Session(Arc::new(soundcraft_model::Session::default()), Vec::new())).unwrap();
+        tx.send(test_session(Arc::new(soundcraft_model::Session::default()), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
         // A sample-rate change rebuilds the engine without dropping plugins on this thread.
-        tx.send(Cmd::Session(
+        tx.send(test_session(
             Arc::clone(&s),
             vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin: soundcraft_dsp::create("gain").unwrap() }],
         ))
@@ -1472,14 +1585,14 @@ mod tests {
         st.fill(&mut out, 2);
         let mut s44 = (*s).clone();
         s44.sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
-        tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
+        tx.send(test_session(Arc::new(s44), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
     }
 
     #[test]
     fn plugin_states_are_read_without_the_audio_thread() {
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, std::sync::mpsc::channel().1);
         let (a, b) = (TrackId(1), TrackId(2));
         side.states.insert((b, 0), Box::new(|| Some(b"b0".to_vec())));
         side.states.insert((a, soundcraft_mix::INSTRUMENT_SLOT), Box::new(|| Some(b"synth".to_vec())));
@@ -1508,7 +1621,7 @@ mod tests {
 
     #[test]
     fn a_refused_state_is_kept_until_the_editor_opens() {
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, std::sync::mpsc::channel().1);
         let k = (TrackId(1), 0);
         side.states.insert(k, Box::new(|| Some(b"defaults".to_vec())));
         side.editors.insert(k, Box::new(Window));
@@ -1522,7 +1635,7 @@ mod tests {
     #[test]
     fn side_creates_each_missing_instance_once() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, std::sync::mpsc::channel().1);
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
@@ -1544,7 +1657,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
         let mut side = Side::new(48_000.0, grx);
@@ -1555,7 +1668,7 @@ mod tests {
             let s = Arc::new(soundcraft_model::Session::default());
             watched.push(Arc::downgrade(&s));
             side.collect_garbage();
-            tx.send(Cmd::Session(s, Vec::new())).unwrap();
+            tx.send(test_session(s, Vec::new())).unwrap();
             st.fill(&mut out, 2);
             let replaced = watched.len().checked_sub(2).and_then(|i| watched.get(i));
             assert!(replaced.is_none_or(|w| w.strong_count() == 1), "freed on the audio thread");
@@ -1573,7 +1686,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         tx.send(Cmd::Play { from: 0, end: None, looped: Some(Range::new(0, 1000)) }).unwrap();
         let mut out = vec![0.0f32; 20_000];
@@ -1608,7 +1721,7 @@ mod tests {
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
-            let (tx, rx) = channel();
+            let (tx, rx) = test_channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
             tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
             let mut out = vec![0.0f32; 2 * 512];
@@ -1639,7 +1752,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &s);
-        let (tx, rx) = channel();
+        let (tx, rx) = test_channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
         let ring = record::InputRing::new(1, 48_000);
         tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
@@ -1651,5 +1764,153 @@ mod tests {
         st.fill(&mut out, 2);
         assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
         assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    }
+
+    #[cfg(not(feature = "plugin-hosts"))]
+    #[test]
+    fn mobile_session_handoff_uses_the_prepared_box_and_preserves_the_live_tail() {
+        use soundcraft_model::{ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackKind};
+        let mut session = Session::default();
+        session.edit.click = false;
+        let vocal = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let signal = (0..24_000).map(|n| if n < 512 { (n as f32 * 0.21).sin() * 0.4 } else { 0.0 }).collect();
+        session
+            .pool
+            .insert(SourceId(1), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+        let clip = session.new_clip_id();
+        session.track_mut(vocal).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip, "take", SourceId(1), 0, 0, 24_000));
+        let mut reverb = Insert::new("room_reverb");
+        reverb.params.insert("mix".into(), 60.0);
+        session.track_mut(vocal).unwrap().mixer.inserts[0] = Some(reverb);
+        let latent = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let mut comp = Insert::new("compressor");
+        comp.params.insert("lookahead".into(), 5.0);
+        session.track_mut(latent).unwrap().mixer.inserts[0] = Some(comp);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
+        tx.send(Cmd::OldSessions(old_tx)).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        let mut reference = MixEngine::new(48_000.0, BLOCK);
+        let mut expected = vec![vec![0.0; 128]; 2];
+        let mut output = vec![0.0; 256];
+        let mut tail = false;
+        for block in 0..80 {
+            let mut prepared_address = None;
+            let mut old_address = None;
+            if [12, 24, 36, 48].contains(&block) {
+                if block < 48 {
+                    session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+                } else {
+                    session.track_mut(vocal).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("mix".into(), 30.0);
+                }
+                prepare_meter_layout(&shared, &session);
+                let command = session_command(Arc::new(session.clone()), Vec::new(), block * 128);
+                if let Cmd::Session(_, mix) = &command {
+                    prepared_address = Some(std::ptr::from_ref(mix.as_ref()));
+                }
+                old_address = Some(std::ptr::from_ref(state.mix.as_ref()));
+                tx.send(command).unwrap();
+            }
+            state.fill(&mut output, 2);
+            reference.render(&session, block * 128, 128, &mut expected);
+            for (i, frame) in output.chunks_exact(2).enumerate() {
+                assert_eq!(frame, &[expected[0][i].clamp(-1.0, 1.0), expected[1][i].clamp(-1.0, 1.0)], "block {block}");
+            }
+            if let Some(prepared) = prepared_address {
+                assert!(std::ptr::eq(prepared, std::ptr::from_ref(state.mix.as_ref())));
+                let retired = old_rx.try_recv().unwrap();
+                assert!(std::ptr::eq(old_address.unwrap(), std::ptr::from_ref(retired._mix.as_ref().unwrap().as_ref())));
+                drop(retired); // Simulated control-thread collection, outside fill().
+            }
+            tail |= block > 12 && output.iter().any(|v| v.abs() > 1e-6);
+        }
+        assert!(tail, "handoff must preserve an actually sounding tail");
+    }
+
+    #[cfg(all(not(feature = "plugin-hosts"), not(target_arch = "wasm32")))]
+    #[test]
+    fn mobile_command_overload_stops_output_and_reports_once() {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(true),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
+        let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+        state.playing = true;
+        let player = Player {
+            shared: Arc::clone(&shared),
+            fault: Arc::default(),
+            watch: Mutex::new(None),
+            tx,
+            side: Mutex::new(Side::new(48_000.0, grx)),
+            _stream: None,
+            device_name: "test".into(),
+            device_rate: 48_000,
+            device_channels: 2,
+            device_buffer: None,
+            silent: true,
+        };
+        for _ in 0..9 {
+            player.set_recording(false);
+        }
+        let mut output = vec![1.0; 256];
+        state.fill(&mut output, 2);
+        assert!(output.iter().all(|v| *v == 0.0));
+        assert!(!state.playing);
+        assert!(!shared.playing.load(Ordering::Relaxed));
+        assert_eq!(player.trouble(), Some(OutputTrouble::Overloaded));
+        assert_eq!(player.trouble(), None);
+    }
+
+    #[test]
+    fn replaced_input_rings_are_retired_without_overwriting_pending_ownership() {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = test_channel();
+        let (mut old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
+        for _ in 0..OLD_SESSIONS {
+            old_tx.try_send(RetiredSession { _session: None, _mix: None, _input: None }).ok();
+        }
+        tx.send(Cmd::OldSessions(old_tx)).unwrap();
+        let mut state = AudioState::new(rx, shared, Arc::new(Session::default()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        let first = record::InputRing::new(1, 48_000);
+        let second = record::InputRing::new(2, 48_000);
+        let third = record::InputRing::new(1, 48_000);
+        tx.send(Cmd::Input(Arc::clone(&first))).unwrap();
+        tx.send(Cmd::Input(Arc::clone(&second))).unwrap();
+        tx.send(Cmd::Input(Arc::clone(&third))).unwrap();
+        state.drain();
+        assert!(Arc::ptr_eq(state.input.as_ref().unwrap(), &second));
+        assert_eq!(Arc::strong_count(&first), 2, "pending state must retain the replaced ring");
+        state.drain();
+        assert!(Arc::ptr_eq(state.input.as_ref().unwrap(), &second));
+        old_rx.try_recv().ok();
+        state.drain();
+        assert!(Arc::ptr_eq(state.input.as_ref().unwrap(), &third));
+        assert_eq!(Arc::strong_count(&first), 2);
+        assert_eq!(Arc::strong_count(&second), 2);
+        while let Ok(old) = old_rx.try_recv() {
+            drop(old);
+        }
+        assert_eq!(Arc::strong_count(&first), 1);
+        state.drain();
+        while let Ok(old) = old_rx.try_recv() {
+            drop(old);
+        }
+        assert_eq!(Arc::strong_count(&second), 1);
     }
 }
