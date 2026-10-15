@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (downstream master overload telemetry; device readiness unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (downstream master and per-track overload telemetry; device readiness unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
 SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the absence of
@@ -79,10 +79,18 @@ with a new Player. It describes the master mix before device folding; it is not
 oversampled true peak, ADC overload detection or a hardware measurement. No
 allocation, logging or lock is added to the callback for the count.
 
+Per-strip meters also retain a saturating full-scale block counter. Quiet blocks
+and level clears preserve the history; a compatible prepared-mixer handoff copies
+it by track ID. Publishing a later meter snapshot therefore retains evidence of
+short overloads even if an earlier best-effort publication was skipped. The
+counter adds no callback allocation or locking and describes the post-fader,
+pre-pan track output, not individual plugin inputs or an ADC.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Per-strip overload history survives quiet blocks, level clears and compatible mobile mixer handoffs |
 | 2026-10-15 | minor | Downstream callback-side master overload counter; regression covers meter contention and quiet blocks; physical readiness unchanged |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |
 | 2026-10-12 | minor | Audio device settings: system, output, input, sample rate and buffer size; opt-in ASIO |

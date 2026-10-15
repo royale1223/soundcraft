@@ -162,6 +162,8 @@ pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_blo
 /// Peak meter values for one strip (linear, per channel, max over the last block).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StripMeter {
+    /// Rendered full-scale blocks; retained across level clears and compatible handoffs.
+    pub clip_events: u32,
     /// First two channels (mono strips repeat channel 0), for stereo meters.
     pub peak: [f32; 2],
     /// Every channel of the strip (or of the main mix).
@@ -191,13 +193,14 @@ impl PluginFailures {
 impl StripMeter {
     /// Copy another meter without reallocating once the channel count is stable.
     pub fn copy_from(&mut self, o: &StripMeter) {
+        self.clip_events = o.clip_events;
         self.peak = o.peak;
         self.peaks.clone_from(&o.peaks);
         self.gain_reduction_db = o.gain_reduction_db;
         self.plugin_failures = o.plugin_failures;
     }
 
-    /// Reset meter values while retaining the per-channel storage for realtime reuse.
+    /// Reset instantaneous values, retaining overload history and channel storage.
     pub fn clear(&mut self) {
         self.peak = [0.0; 2];
         self.peaks.fill(0.0);
@@ -211,6 +214,9 @@ impl StripMeter {
         }
         for (p, b) in self.peaks.iter_mut().zip(bufs.iter()) {
             *p = peak(b.get(..frames).unwrap_or(&[]));
+        }
+        if self.peaks.iter().any(|peak| peak.is_finite() && *peak >= 1.0) {
+            self.clip_events = self.clip_events.saturating_add(1);
         }
         let last = self.peaks.len().saturating_sub(1);
         self.peak = [self.peaks.first().copied().unwrap_or(0.0), self.peaks.get(1.min(last)).copied().unwrap_or(0.0)];
@@ -2342,6 +2348,21 @@ fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
 #[cfg(test)]
 mod audio_thread_tests {
     use super::*;
+
+    #[test]
+    fn strip_overloads_survive_quiet_blocks_and_level_clears() {
+        let mut meter = StripMeter::default();
+        meter.measure(&[vec![0.2, 1.0, 0.1]], 3, 0.0);
+        assert_eq!(meter.clip_events, 1);
+        meter.measure(&[vec![0.0; 3]], 3, 0.0);
+        assert_eq!(meter.clip_events, 1);
+        meter.clear();
+        assert_eq!(meter.clip_events, 1);
+        assert_eq!(meter.peak, [0.0; 2]);
+        let mut published = StripMeter::default();
+        published.copy_from(&meter);
+        assert_eq!(published.clip_events, 1);
+    }
 
     #[test]
     fn only_a_marked_thread_is_the_audio_thread() {

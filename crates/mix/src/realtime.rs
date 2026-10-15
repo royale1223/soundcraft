@@ -62,6 +62,12 @@ impl MixEngine {
         if self.sample_rate != previous.sample_rate || self.max_block != previous.max_block {
             return;
         }
+        self.main_meter.clip_events = previous.main_meter.clip_events;
+        for (id, meter) in &mut self.meters {
+            if let Some(old) = previous.meters.get(id) {
+                meter.clip_events = old.clip_events;
+            }
+        }
         self.last_end = previous.last_end;
         self.input_channels = previous.input_channels;
         self.monitor_only = previous.monitor_only;
@@ -164,6 +170,22 @@ mod tests {
             assert_eq!(a, b, "silent probing must not advance the real DSP or parameter ramps");
             assert_eq!(prepared.strips[&vocal].align.bufs[0].as_ptr(), delay);
         }
+    }
+
+    #[test]
+    fn prepared_replacement_retains_each_tracks_overload_history() {
+        let (session, vocal, other) = session();
+        let mut live = MixEngine::new(48_000.0, 512);
+        live.prepare_realtime(&session, 0);
+        live.meters.get_mut(&vocal).unwrap().clip_events = 7;
+        live.meters.get_mut(&other).unwrap().clip_events = 2;
+        let mut next = MixEngine::new(48_000.0, 512);
+        next.prepare_realtime(&session, 0);
+        next.inherit_runtime(&mut live);
+        assert_eq!(next.meters[&vocal].clip_events, 7);
+        assert_eq!(next.meters[&other].clip_events, 2);
+        next.reset();
+        assert_eq!(next.meters[&vocal].clip_events, 7);
     }
 
     #[test]
