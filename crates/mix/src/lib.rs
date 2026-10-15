@@ -228,6 +228,8 @@ struct PluginSlot {
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    /// Parameter identities corresponding to `applied`; prepared during sync.
+    applied_keys: Vec<String>,
     failed: bool,
 }
 
@@ -430,7 +432,14 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false })
+        Some(PluginSlot {
+            id: ins.plugin.clone(),
+            ch,
+            plugin,
+            applied: vec![f32::NAN; ins.params.len()],
+            applied_keys: ins.params.keys().cloned().collect(),
+            failed: false,
+        })
     }
 }
 
@@ -475,6 +484,9 @@ impl MixEngine {
     /// Takes instances created off the audio thread; the next render's `sync` places them.
     /// An earlier instance waiting for the same slot is retired.
     pub fn adopt(&mut self, instances: Vec<PreparedInstance>) {
+        if instances.is_empty() {
+            return;
+        }
         for p in instances {
             if let Some(old) = self.adopt.insert((p.track, p.slot), p) {
                 self.retired.push(old.plugin);
@@ -557,6 +569,7 @@ impl MixEngine {
         if self.main.len() != main_ch {
             self.main = vec![vec![0.0; mb]; main_ch];
         }
+        self.main_meter.peaks.resize(main_ch, 0.0);
         let mut cx = SlotCtx { sr: self.sample_rate, mb, external: self.external, adopt: &mut self.adopt, retired: &mut self.retired };
         let gone: Vec<TrackId> = self.strips.keys().filter(|id| s.track(**id).is_none()).copied().collect();
         for id in gone {
@@ -578,6 +591,16 @@ impl MixEngine {
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
             }
+            for buffer in [&mut strip.pre, &mut strip.outbuf] {
+                if buffer.len() != ch || buffer.first().map_or(0, Vec::len) != mb {
+                    *buffer = vec![vec![0.0; mb]; ch];
+                }
+            }
+            // Prepare even the zero-delay channel vectors. Keep existing delay
+            // histories when syncing unrelated document edits.
+            strip.align.set(strip.align.len, ch);
+            strip.align_pre.set(strip.align_pre.len, ch);
+            strip.out_extra.set(strip.out_extra.len, ch);
             if strip.scratch.len() < mb {
                 strip.scratch.resize(mb, 0.0);
             }
@@ -599,6 +622,9 @@ impl MixEngine {
                     }
                     _ => {}
                 }
+                if let (Some(slot), Some(ins)) = (slot, ins) {
+                    prepare_param_cache(slot, ins);
+                }
             }
             let want = t.instrument.as_ref();
             let ich = ch.max(2);
@@ -609,6 +635,9 @@ impl MixEngine {
                 cx.retire(old);
                 strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
                 strip.sample = None;
+            }
+            if let (Some(slot), Some(ins)) = (&mut strip.instrument, want) {
+                prepare_param_cache(slot, ins);
             }
             sync_sample(strip, want, s);
         }
@@ -1256,11 +1285,23 @@ fn structure_fingerprint(s: &Session) -> usize {
         t.mixer.output.hash(&mut h);
         for i in &t.mixer.inserts {
             i.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+            if let Some(i) = i {
+                i.params.len().hash(&mut h);
+                for key in i.params.keys() {
+                    key.hash(&mut h);
+                }
+            }
         }
         for snd in t.mixer.sends.iter().flatten() {
             snd.target.hash(&mut h);
         }
         t.instrument.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+        if let Some(i) = &t.instrument {
+            i.params.len().hash(&mut h);
+            for key in i.params.keys() {
+                key.hash(&mut h);
+            }
+        }
         let sample = t.instrument.as_ref().and_then(|x| x.sample);
         sample.hash(&mut h);
         // Which decoded audio it is, so new audio under the same id (another session) re-syncs.
@@ -1703,6 +1744,15 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
         }
         val
     });
+}
+
+/// Allocate value caches while synchronizing, retaining them for value-only edits.
+fn prepare_param_cache(slot: &mut PluginSlot, ins: &soundcraft_model::Insert) {
+    if !slot.applied_keys.iter().eq(ins.params.keys()) {
+        slot.applied_keys = ins.params.keys().cloned().collect();
+        slot.applied.resize(ins.params.len(), f32::NAN);
+        slot.applied.fill(f32::NAN);
+    }
 }
 
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
@@ -3157,6 +3207,72 @@ mod tests {
         assert_eq!(engine.aux_fed.capacity(), aux_fed_capacity);
         assert_eq!(engine.strips[&track].scratch.capacity(), scratch_capacity);
         assert!(meter.peak[0] > 0.0);
+    }
+
+    #[test]
+    fn preparation_retains_buffers_and_parameter_caches_on_first_render() {
+        let (mut session, track) = session_with_dc(0.5, 4800);
+        let mut insert = Insert::new("gain");
+        insert.params.insert("gain".into(), -6.0);
+        session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
+        let mut engine = MixEngine::new(48_000.0, 512);
+        engine.ensure_synced(&session);
+        let strip = &engine.strips[&track];
+        let slot = strip.plugins[0].as_ref().unwrap();
+        assert_eq!(slot.applied_keys, vec!["gain"]);
+        assert!(slot.applied[0].is_nan(), "preparation must not change parameter smoothing");
+        let cache = slot.applied.as_ptr();
+        let pre = strip.pre[0].as_ptr();
+        let output = strip.outbuf[0].as_ptr();
+        let delay = strip.align.bufs.as_ptr();
+        let main_meter = engine.main_meter.peaks.as_ptr();
+        assert_eq!(strip.pre[0].len(), 512);
+        assert_eq!(strip.outbuf[0].len(), 512);
+        assert_eq!(strip.align.bufs.len(), 1);
+        assert_eq!(strip.align_pre.bufs.len(), 1);
+        assert_eq!(strip.out_extra.bufs.len(), 1);
+        assert_eq!(engine.main_meter.peaks.len(), 2);
+        let synchronized = engine.synced;
+        engine.adopt(Vec::new());
+        assert_eq!(engine.synced, synchronized, "empty mobile adoption must keep the prepared layout");
+
+        let mut prepared = vec![vec![0.0; 512]; 2];
+        engine.render(&session, 0, 512, &mut prepared);
+        let strip = &engine.strips[&track];
+        assert_eq!(strip.plugins[0].as_ref().unwrap().applied.as_ptr(), cache);
+        assert_eq!(strip.pre[0].as_ptr(), pre);
+        assert_eq!(strip.outbuf[0].as_ptr(), output);
+        assert_eq!(strip.align.bufs.as_ptr(), delay);
+        assert_eq!(engine.main_meter.peaks.as_ptr(), main_meter);
+        let mut lazy = MixEngine::new(48_000.0, 512);
+        let mut reference = vec![vec![0.0; 512]; 2];
+        lazy.render(&session, 0, 512, &mut reference);
+        assert_eq!(prepared, reference, "preparation must preserve the shared render path");
+    }
+
+    #[test]
+    fn changing_parameter_names_with_same_value_updates_the_plugin() {
+        let (mut session, track) = session_with_dc(0.5, 4800);
+        let mut insert = Insert::new("compressor");
+        insert.params.insert("attack".into(), 30.0);
+        session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
+        let mut engine = MixEngine::new(48_000.0, 512);
+        let mut output = vec![vec![0.0; 512]; 2];
+        engine.render(&session, 0, 512, &mut output);
+        let old_key = engine.synced;
+        let insert = session.track_mut(track).unwrap().mixer.inserts[0].as_mut().unwrap();
+        insert.params.clear();
+        insert.params.insert("release".into(), 30.0);
+        engine.ensure_synced(&session);
+        assert_ne!(engine.synced, old_key, "parameter identities are part of preparation");
+        let slot = engine.strips[&track].plugins[0].as_ref().unwrap();
+        assert_eq!(slot.applied_keys, vec!["release"]);
+        assert!(slot.applied[0].is_nan());
+        let cache = slot.applied.as_ptr();
+        engine.render(&session, 512, 512, &mut output);
+        let slot = engine.strips[&track].plugins[0].as_ref().unwrap();
+        assert_eq!(slot.applied.as_ptr(), cache);
+        assert_eq!(slot.plugin.param("release"), Some(30.0));
     }
 
     #[test]
