@@ -2,39 +2,56 @@
 //! commands. Hosting itself lives in `soundcraft-clap-host`.
 
 use super::*;
+#[cfg(feature = "plugin-hosts")]
 use crate::cmd;
+#[cfg(feature = "plugin-hosts")]
 use serde_json::json;
 use soundcraft_dsp::PluginInfo;
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![cmd!(
-        query "engine.clap_plugins",
-        "List CLAP Plugins",
-        [],
-        None,
-        "{rescan?: bool} → [{id: \"clap:…\", plugin_id, name, vendor, version, description, features, category, is_instrument, path}]",
-        always,
-        |_, p| {
-            let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
-                soundcraft_clap_host::rescan()
-            } else {
-                soundcraft_clap_host::scan()
-            };
-            Ok(json!(list))
-        }
-    )]
+    #[cfg(feature = "plugin-hosts")]
+    {
+        vec![cmd!(
+            query "engine.clap_plugins",
+            "List CLAP Plugins",
+            [],
+            None,
+            "{rescan?: bool} → [{id: \"clap:…\", plugin_id, name, vendor, version, description, features, category, is_instrument, path}]",
+            always,
+            |_, p| {
+                let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
+                    soundcraft_clap_host::rescan()
+                } else {
+                    soundcraft_clap_host::scan()
+                };
+                Ok(json!(list))
+            }
+        )]
+    }
+    #[cfg(not(feature = "plugin-hosts"))]
+    {
+        Vec::new()
+    }
 }
 
 /// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
 /// Audio Units (`au:<type>:<subtype>:<manufacturer>`) plugin's.
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
-    soundcraft_dsp::plugin_info(id)
-        .or_else(|| soundcraft_clap_host::plugin_info(id))
-        .or_else(|| soundcraft_vst3_host::plugin_info(id))
-        .or_else(|| soundcraft_au_host::plugin_info(id))
+    let builtin = soundcraft_dsp::plugin_info(id);
+    #[cfg(feature = "plugin-hosts")]
+    {
+        builtin
+            .or_else(|| soundcraft_clap_host::plugin_info(id))
+            .or_else(|| soundcraft_vst3_host::plugin_info(id))
+            .or_else(|| soundcraft_au_host::plugin_info(id))
+    }
+    #[cfg(not(feature = "plugin-hosts"))]
+    {
+        builtin
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "plugin-hosts"))]
 mod tests {
     use crate::Engine;
     use serde_json::json;

@@ -78,9 +78,17 @@ pub const INSTRUMENT_SLOT: usize = usize::MAX;
 
 /// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
 pub fn is_third_party(id: &str) -> bool {
-    id.starts_with(soundcraft_clap_host::ID_PREFIX)
-        || id.starts_with(soundcraft_vst3_host::ID_PREFIX)
-        || id.starts_with(soundcraft_au_host::ID_PREFIX)
+    #[cfg(feature = "plugin-hosts")]
+    {
+        id.starts_with(soundcraft_clap_host::ID_PREFIX)
+            || id.starts_with(soundcraft_vst3_host::ID_PREFIX)
+            || id.starts_with(soundcraft_au_host::ID_PREFIX)
+    }
+    #[cfg(not(feature = "plugin-hosts"))]
+    {
+        let _ = id;
+        false
+    }
 }
 
 /// A third-party plugin instance a session needs: which slot, which plugin, how many channels,
@@ -184,6 +192,14 @@ impl StripMeter {
         self.peaks.clone_from(&o.peaks);
         self.gain_reduction_db = o.gain_reduction_db;
         self.plugin_failures = o.plugin_failures;
+    }
+
+    /// Reset meter values while retaining the per-channel storage for realtime reuse.
+    pub fn clear(&mut self) {
+        self.peak = [0.0; 2];
+        self.peaks.fill(0.0);
+        self.gain_reduction_db = 0.0;
+        self.plugin_failures = PluginFailures::default();
     }
 
     fn measure(&mut self, bufs: &[Vec<f32>], frames: usize, gr: f32) {
@@ -355,6 +371,9 @@ pub struct MixEngine {
     aux_latency: usize,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
+    /// Number of valid live-input channels in `input`. The playback host may keep larger,
+    /// preallocated storage so changing input devices never resizes audio buffers in its callback.
+    pub input_channels: usize,
     /// Transport stopped: only monitored inputs sound (no clips).
     pub monitor_only: bool,
     /// Recording: record-armed tracks hear their input (auto input).
@@ -436,6 +455,7 @@ impl MixEngine {
             aux_fed: Vec::new(),
             aux_latency: 0,
             input: Vec::new(),
+            input_channels: 0,
             monitor_only: false,
             recording: false,
             metronome: false,
@@ -516,8 +536,10 @@ impl MixEngine {
             s.align_pre.clear();
             s.out_extra.clear();
         }
-        self.meters.clear();
-        self.main_meter = StripMeter::default();
+        for meter in self.meters.values_mut() {
+            meter.clear();
+        }
+        self.main_meter.clear();
     }
 
     /// Bring plugin instances in line with the session (creates/destroys as needed). Allocates;
@@ -651,7 +673,8 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_input = self.input.get(..self.input_channels.min(self.input.len())).unwrap_or(&[]);
+        let live_in = LiveInput { input: live_input, monitor_only: self.monitor_only, recording: self.recording };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -732,7 +755,8 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_input = self.input.get(..self.input_channels.min(self.input.len())).unwrap_or(&[]);
+            let live_in = LiveInput { input: live_input, monitor_only: self.monitor_only, recording: self.recording };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -1257,7 +1281,7 @@ pub fn on_audio_thread() -> bool {
 
 /// Run `f` on this thread as (or as not) the audio thread, then restore the thread's own mark
 /// (also when `f` unwinds): a pool worker renders for realtime playback and offline bounces alike.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "parallel-render"))]
 fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     struct Restore(bool);
     impl Drop for Restore {
@@ -1269,8 +1293,8 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     f();
 }
 
-/// Process strips, in parallel on native targets when there are enough of them.
-#[cfg(not(target_arch = "wasm32"))]
+/// Process strips in parallel only when the host opts in; mobile defaults stay serial.
+#[cfg(all(not(target_arch = "wasm32"), feature = "parallel-render"))]
 fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     use rayon::prelude::*;
     if work.len() >= 4 {
@@ -1282,7 +1306,7 @@ fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", not(feature = "parallel-render")))]
 fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     work.iter_mut().for_each(f);
 }
@@ -1359,15 +1383,16 @@ mod click {
         let rate = sr.as_f64();
         let len = (LEN_S * rate) as i64;
         let end = pos.saturating_add(frames as i64);
+        let phase = s.edit.value("click.offset_samples", 0.0).round() as i64;
         let gain = f64::from(db_to_gain(s.edit.value("click.volume_db", -6.0).clamp(-60.0, 12.0) as f32));
         let accent = (note_hz(s.edit.value("click.accent_note", 84.0)), s.edit.value("click.accent_velocity", 127.0));
         let normal = (note_hz(s.edit.value("click.normal_note", 72.0)), s.edit.value("click.normal_velocity", 100.0));
         // Start one blip length early so a click that began in an earlier block still rings into this one.
-        let t0 = s.tempo.samples_to_ticks(pos.saturating_sub(len), sr).max(0).saturating_sub(1);
+        let t0 = s.tempo.samples_to_ticks(pos.saturating_sub(len).saturating_sub(phase), sr).max(0).saturating_sub(1);
         let mut tick = t0.saturating_sub(s.tempo.bar_beat_at_tick(t0).tick);
         // Blocks hold a few beats at most; the guard only protects against a malformed tempo map.
         for _ in 0..4096 {
-            let at = s.tempo.tick_to_samples(tick, sr);
+            let at = s.tempo.tick_to_samples(tick, sr).saturating_add(phase);
             if at >= end {
                 break;
             }
@@ -2220,10 +2245,15 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
 fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
-    soundcraft_dsp::create(id)
-        .or_else(|| soundcraft_clap_host::create(id))
-        .or_else(|| soundcraft_vst3_host::create(id))
-        .or_else(|| soundcraft_au_host::create(id))
+    let builtin = soundcraft_dsp::create(id);
+    #[cfg(feature = "plugin-hosts")]
+    {
+        builtin.or_else(|| soundcraft_clap_host::create(id)).or_else(|| soundcraft_vst3_host::create(id)).or_else(|| soundcraft_au_host::create(id))
+    }
+    #[cfg(not(feature = "plugin-hosts"))]
+    {
+        builtin
+    }
 }
 
 #[cfg(test)]
@@ -2487,12 +2517,14 @@ mod tests {
     }
 
     /// A built-in gain behind a third-party id, with a log of parameter sets.
+    #[cfg(feature = "plugin-hosts")]
     struct Stateful {
         inner: Box<dyn Plugin>,
         blob: Vec<u8>,
         sets: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[cfg(feature = "plugin-hosts")]
     impl Plugin for Stateful {
         fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
             self.inner.info()
@@ -2519,11 +2551,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     struct Clock {
         inner: Box<dyn Plugin>,
         seen: Arc<std::sync::Mutex<Vec<Transport>>>,
     }
 
+    #[cfg(feature = "plugin-hosts")]
     impl Plugin for Clock {
         fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
             self.inner.info()
@@ -2548,6 +2582,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn plugins_get_the_session_transport() {
         let (mut s, t) = session_with_dc(0.5, 48_000 * 4);
@@ -2570,11 +2605,13 @@ mod tests {
         assert!(!seen[1].playing);
     }
 
+    #[cfg(feature = "plugin-hosts")]
     struct Ears {
         inner: Box<dyn Plugin>,
         heard: Arc<std::sync::Mutex<Vec<(usize, [u8; 3])>>>,
     }
 
+    #[cfg(feature = "plugin-hosts")]
     impl Plugin for Ears {
         fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
             self.inner.info()
@@ -2599,6 +2636,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn controllers_play_at_their_offsets_and_are_chased_after_a_seek() {
         let mut s = Session::default();
@@ -2622,11 +2660,13 @@ mod tests {
         assert!(heard.lock().unwrap().is_empty());
     }
 
+    #[cfg(feature = "plugin-hosts")]
     struct Keys {
         inner: Box<dyn Plugin>,
         heard: Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
     }
 
+    #[cfg(feature = "plugin-hosts")]
     impl Plugin for Keys {
         fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
             self.inner.info()
@@ -2651,6 +2691,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn real_time_properties_reach_the_instrument() {
         let mut s = Session::default();
@@ -2671,12 +2712,14 @@ mod tests {
         assert_eq!(*heard.lock().unwrap(), vec![(72, 80)]);
     }
 
+    #[cfg(feature = "plugin-hosts")]
     fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
         let mut out = vec![vec![0.0f32; 512]; 2];
         eng.render(s, pos, 512, &mut out);
         out[0][500]
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn external_instances_are_adopted_and_retired() {
         let (mut s, t) = session_with_dc(0.5, 48_000);
@@ -2719,8 +2762,10 @@ mod tests {
         assert!(eng.drain_plugins().is_empty());
     }
 
+    #[cfg(feature = "plugin-hosts")]
     struct Nan(Box<dyn Plugin>);
 
+    #[cfg(feature = "plugin-hosts")]
     impl Plugin for Nan {
         fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
             self.0.info()
@@ -2742,10 +2787,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     fn nan(track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
         vec![PreparedInstance { track, slot, id: "clap:test.nan".into(), ch, plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())) }]
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn an_insert_that_puts_out_nan_is_taken_out_until_the_next_reset() {
         let (mut s, a) = session_with_dc(0.5, 48_000);
@@ -2765,6 +2812,7 @@ mod tests {
         assert_eq!(eng.meters[&a].plugin_failures.count, 2);
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn nan_from_an_instrument_or_a_master_insert_is_contained() {
         let mut s = synth_session(-6.0);
@@ -2786,6 +2834,7 @@ mod tests {
         assert_eq!(render_block(&mut eng, &s, 1024), only_b);
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn a_new_instance_replaces_a_matching_one_in_its_slot() {
         // The host removed and re-added the plugin, and both session updates reached the audio
@@ -2812,6 +2861,7 @@ mod tests {
         assert_eq!(retired[0].save_state(), Some(b"old".to_vec()), "the new instance stays");
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn stored_state_comes_first_then_session_params() {
         let (mut s, t) = session_with_dc(0.5, 48_000);
@@ -2984,6 +3034,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-hosts")]
     #[test]
     fn a_plugins_bogus_latency_is_capped() {
         struct Latent(Box<dyn Plugin>);
@@ -3029,6 +3080,7 @@ mod tests {
         let (mut s, t) = session_with_dc(0.5, 4800);
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.input = vec![vec![0.25; 512]];
+        eng.input_channels = 1;
         let mut out = vec![vec![0.0; 512]; 2];
         // Not monitored: the clip plays.
         eng.render(&s, 0, 512, &mut out);
@@ -3043,6 +3095,25 @@ mod tests {
         s.track_mut(t).unwrap().mixer.input_monitor = false;
         eng.render(&s, 1024, 512, &mut out);
         assert!(out[0][100].abs() < 1e-6, "stopped, unmonitored: silence");
+    }
+
+    #[test]
+    fn reset_clears_meter_values_without_releasing_track_storage() {
+        let (s, track) = session_with_dc(0.5, 4800);
+        let mut engine = MixEngine::new(48_000.0, 512);
+        let mut output = vec![vec![0.0; 512]; 2];
+        engine.render(&s, 0, 512, &mut output);
+        let capacity = engine.meters.get(&track).map(|m| m.peaks.capacity()).unwrap_or(0);
+        assert!(capacity > 0);
+        assert!(engine.meters.get(&track).is_some_and(|m| m.peak[0] > 0.0));
+
+        engine.reset();
+
+        let meter = engine.meters.get(&track);
+        assert!(meter.is_some(), "track meter retained");
+        assert_eq!(meter.map_or([1.0; 2], |m| m.peak), [0.0; 2]);
+        assert!(meter.is_some_and(|m| m.peaks.iter().all(|peak| *peak == 0.0)));
+        assert_eq!(meter.map_or(0, |m| m.peaks.capacity()), capacity);
     }
 
     #[test]
@@ -3124,6 +3195,16 @@ mod tests {
         // Blocks that start mid-beat render the same clicks as a single pass.
         let split = render_playback(&s, len, 97, false);
         assert_eq!(out, split);
+    }
+
+    #[test]
+    fn playback_click_respects_a_persisted_beat_phase() {
+        let mut s = Session::default();
+        s.edit.click = true;
+        s.edit.values.insert("click.offset_samples".into(), 12_000.0);
+        let out = render_playback(&s, 24_000, 97, false);
+        assert!(out[0][..12_000].iter().all(|sample| *sample == 0.0));
+        assert!(out[0][12_000..12_200].iter().any(|sample| sample.abs() > 0.1));
     }
 
     #[test]

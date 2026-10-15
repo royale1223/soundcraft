@@ -7,17 +7,27 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = ["plugin-hosts", "video"]
+plugin-hosts = [
+    "dep:soundcraft-clap-host",
+    "dep:soundcraft-vst3-host",
+    "dep:soundcraft-au-host",
+    "soundcraft-mix/plugin-hosts",
+]
+video = ["dep:soundcraft-video"]
+
 [dependencies]
 soundcraft-time.workspace = true
 soundcraft-audio-io.workspace = true
 soundcraft-midi.workspace = true
 soundcraft-dsp.workspace = true
-soundcraft-clap-host.workspace = true
-soundcraft-vst3-host.workspace = true
-soundcraft-au-host.workspace = true
+soundcraft-clap-host = { workspace = true, optional = true }
+soundcraft-vst3-host = { workspace = true, optional = true }
+soundcraft-au-host = { workspace = true, optional = true }
 soundcraft-model.workspace = true
-soundcraft-mix.workspace = true
-soundcraft-video.workspace = true
+soundcraft-mix = { path = "../mix", default-features = false }
+soundcraft-video = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

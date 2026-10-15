@@ -122,6 +122,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "plugin-hosts", feature = "video"))]
     #[test]
     fn parity_floor() {
         let p = parity_json();

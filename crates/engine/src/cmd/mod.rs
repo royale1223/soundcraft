@@ -32,9 +32,11 @@ mod tab;
 mod track;
 mod track_more;
 mod transport;
+#[cfg(feature = "video")]
 mod video;
 mod view;
 mod view_more;
+#[cfg(feature = "plugin-hosts")]
 mod vst3;
 mod zoom_toggle;
 
@@ -129,11 +131,13 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(event_more::specs());
         v.extend(setup_more::specs());
         v.extend(clap::specs());
+        #[cfg(feature = "plugin-hosts")]
         v.extend(vst3::specs());
         v.extend(surround::specs());
         v.extend(plugin_state::specs());
         v.extend(instrument::specs());
         v.extend(sampler::specs());
+        #[cfg(feature = "video")]
         v.extend(video::specs());
         v.extend(zoom_toggle::specs());
         v
@@ -340,6 +344,21 @@ mod tests {
             assert!(c.id.contains('.'), "ids are namespaced: {}", c.id);
         }
         assert!(command_specs().len() > 150, "only {} commands", command_specs().len());
+    }
+
+    #[cfg(not(feature = "plugin-hosts"))]
+    #[test]
+    fn mobile_build_omits_desktop_plugin_commands_but_keeps_builtins() {
+        assert!(find_command("engine.clap_plugins").is_none());
+        assert!(find_command("engine.vst3_plugins").is_none());
+        assert!(clap::plugin_info("eq_7band").is_some());
+    }
+
+    #[cfg(not(feature = "video"))]
+    #[test]
+    fn mobile_build_omits_video_commands() {
+        assert!(find_command("file.import_video").is_none());
+        assert!(find_command("video.list").is_none());
     }
 
     #[test]

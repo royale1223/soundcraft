@@ -1,3 +1,5 @@
+#![cfg(feature = "plugin-hosts")]
+
 //! A hosted CLAP plugin through the whole stack: `mix.insert` / `mix.insert_param` accept a
 //! `clap:` id and the mix engine renders through it. Uses the test plugin built from
 //! `crates/clap-host/tests/fixture` (a gain whose param "7" is linear gain).

@@ -835,6 +835,9 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
             }
         }
     }
+    // Trimming a crossfaded neighbour can move its start beyond the following clip. Keep the
+    // playlist's ordering invariant after all midpoint adjustments have been applied.
+    pl.sort();
     n
 }
 

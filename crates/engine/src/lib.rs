@@ -30,6 +30,7 @@ pub use soundcraft_model as model;
 /// loaded. Call it at the end of `main`, once every plugin instance (mixer, player) is gone: a
 /// plugin that has been used can crash when its module exit only runs from an exit handler.
 pub fn shutdown_plugin_hosts() {
+    #[cfg(feature = "plugin-hosts")]
     soundcraft_vst3_host::shutdown();
 }
 
