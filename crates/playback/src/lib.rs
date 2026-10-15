@@ -1995,4 +1995,103 @@ mod tests {
         }
         assert!(audible, "automation regression must render actual source audio");
     }
+
+    #[cfg(not(feature = "plugin-hosts"))]
+    #[test]
+    fn mobile_five_track_vocal_workload_has_no_callback_allocations_or_frees() {
+        use soundcraft_model::{ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackKind};
+        const CALLBACKS: usize = 1024;
+        for frames in [128, 256] {
+            let mut session = Session::default();
+            session.edit.click = false;
+            let mut audio_tracks = Vec::new();
+            for index in 0..5 {
+                let format = if index == 0 { ChannelFormat::Stereo } else { ChannelFormat::Mono };
+                let track_id = session.add_track(TrackKind::Audio, format, None);
+                audio_tracks.push(track_id);
+                let source = SourceId(session.alloc());
+                let signal: Vec<f32> = (0..frames * CALLBACKS).map(|n| (n as f32 * (0.017 + index as f32 * 0.009)).sin() * 0.03).collect();
+                session.pool.insert(
+                    source,
+                    Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal; format.channels()] })),
+                );
+                let clip_id = session.new_clip_id();
+                let track = session.track_mut(track_id).unwrap();
+                track.playlist_mut().unwrap().clips.push(Clip::audio(clip_id, "synthetic vocal workload", source, 0, 0, (frames * CALLBACKS) as i64));
+                if index > 0 {
+                    for (slot, plugin) in ["eq_7band", "compressor", "de_esser", "room_reverb"].iter().enumerate() {
+                        let mut insert = Insert::new(*plugin);
+                        let info = soundcraft_dsp::plugin_info(plugin).unwrap();
+                        insert.params.extend(info.params.iter().map(|param| (param.id.into(), param.default)));
+                        match slot {
+                            0 => {
+                                insert.params.insert("hpf_on".into(), 1.0);
+                            }
+                            1 => {
+                                insert.params.insert("lookahead".into(), [0.0, 2.0, 5.0, 10.0][index - 1]);
+                            }
+                            3 => {
+                                insert.params.insert("mix".into(), 20.0);
+                            }
+                            _ => {}
+                        }
+                        track.mixer.inserts[slot] = Some(insert);
+                    }
+                }
+            }
+            let master = session.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
+            session.track_mut(master).unwrap().mixer.volume_db = -3.0;
+            let session = Arc::new(session);
+            let shared = Arc::new(Shared {
+                position: AtomicI64::new(0),
+                playing: AtomicBool::new(false),
+                speed: AtomicU32::new(1000),
+                meters: Mutex::new(MeterSnapshot::default()),
+            });
+            prepare_meter_layout(&shared, &session);
+            let (tx, rx) = channel();
+            let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+            tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+            let fault = Fault::default();
+            let mut output = vec![0.0; frames * 2];
+            let mut reference = MixEngine::new(48_000.0, BLOCK);
+            let mut expected = vec![vec![0.0; frames]; 2];
+            let mut timings = Vec::with_capacity(CALLBACKS);
+            let mut audible = false;
+            for block in 0..CALLBACKS {
+                let started = std::time::Instant::now();
+                let allocations = allocation_counter::measure(|| guarded_block(&fault, &shared, &mut output, |out| state.fill(out, 2)));
+                timings.push(started.elapsed().as_micros());
+                assert_eq!(allocations.count_total, 0, "{frames}-frame vocal callback allocated in block {block}: {allocations:?}");
+                assert_eq!(allocations.count_current, 0, "{frames}-frame vocal callback freed objects in block {block}: {allocations:?}");
+                assert!(!fault.failed.load(Ordering::Relaxed));
+                reference.render(&session, (block * frames) as i64, frames, &mut expected);
+                for (index, frame) in output.chunks_exact(2).enumerate() {
+                    assert_eq!(
+                        frame,
+                        &[expected[0][index].clamp(-1.0, 1.0), expected[1][index].clamp(-1.0, 1.0)],
+                        "workload PCM differs at {frames} frames, block {block}"
+                    );
+                    audible |= frame.iter().any(|sample| sample.abs() > 1e-5);
+                }
+            }
+            assert!(audible);
+            let meters = shared.meters.lock().unwrap();
+            for track in audio_tracks {
+                assert!(
+                    meters.tracks.get(&track).is_some_and(|meter| meter.peak.iter().any(|peak| *peak > 1e-5)),
+                    "each workload track must actually produce metered audio"
+                );
+            }
+            drop(meters);
+            assert_eq!(shared.position.load(Ordering::Relaxed), (frames * CALLBACKS) as i64);
+            timings.sort_unstable();
+            eprintln!(
+                "mobile_vocal_workload frames={frames} callbacks={CALLBACKS} rate=48000 p50_us={} p95_us={} max_us={} rust_allocations=0 rust_frees=0",
+                timings[CALLBACKS / 2],
+                timings[CALLBACKS * 95 / 100],
+                timings[CALLBACKS - 1]
+            );
+        }
+    }
 }

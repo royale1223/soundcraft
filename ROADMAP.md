@@ -122,6 +122,8 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
+- **2026-10-15 (target mobile vocal workload):** A guarded AudioState regression renders one stereo backing plus four mono vocal strips, each with EQ, compressor, de-esser, and reverb, through a stereo master at 48 kHz. Both 128/256-frame configurations run 1,024 callbacks with zero Rust allocations/frees and exact PCM agreement with the persistent mix reference. Every audio strip must produce a nonzero meter. Instrumented host timings are printed for reproducibility; they do not establish phone deadlines, driver behavior, drift, or 30-minute stability.
+
 - **2026-10-15 (measured callback allocation regressions):** A test-only Rust allocation counter now measures guarded mobile callback bodies. Track additions/removal, reverb edits, larger compensation-capacity handoff, and combined lookahead automation retain sample equality with a persistent mixer while recording zero Rust heap allocations/frees. The baseline lookahead transition allocated twice; prepared maximum-latency bounds and retained delay capacity remove that path. Compressor declares its prepared bound; all built-in parameter extrema/defaults are swept at 44.1/48/96 kHz. Handoffs copy live history into larger prepared rings where needed. Bus scratch ownership clones the existing hasher rather than creating a callback-thread RandomState. These host scenarios do not establish native driver allocation behavior or physical deadlines; clip-effect preparation and other unmeasured paths remain open.
 
 - **2026-10-15 (bounded mobile playback handoff):** Built-in-only playback prepares replacement mixers and static compensation storage on the control thread, transfers compatible live DSP state, and returns whole old mixers/snapshots through a fixed-capacity SPSC retirement ring. The command ring holds eight entries and the retirement ring four; callback draining remains bounded and ordered. Overload silences output and reports a fault for control-thread recovery. Replaced input rings use the same retirement path; backpressure retains ownership without overwriting it. Host regressions exercise actual AudioState handoffs, PCM/tail continuity, overload, producer-lock independence, and saturated retirement. Dynamic latency/clip-effect preparation and physical callback measurements remain open. Hosted playback retains its existing preparation path.
@@ -165,6 +167,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Measure the five-track vocal workload at 128/256-frame callbacks |
 | 2026-10-15 | minor | Instrument guarded mobile callbacks and reserve dynamic delay capacity |
 | 2026-10-15 | minor | Connect bounded mobile session handoff and retire whole mixer/input ownership |
 | 2026-10-15 | minor | Add built-in prepared-mixer state handoff with tail and retirement regressions |

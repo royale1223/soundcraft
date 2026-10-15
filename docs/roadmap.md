@@ -32,6 +32,13 @@ prepared rings retain capacity while inheriting old delay history. These are hos
 Rust allocation measurements; driver allocation behavior, physical deadlines,
 clip-effect preparation/state, and other unmeasured paths remain open.
 
+A target-workload regression also exercises one stereo backing plus four mono
+vocal strips with EQ/compressor/de-esser/reverb and a stereo master. At 48 kHz,
+both 128/256-frame callbacks produce exact reference PCM across 1,024 blocks,
+zero Rust allocations/frees, and nonzero meters for every audio track. Printed
+instrumented host timings are diagnostic only: phone deadlines, driver behavior,
+drift, and long-duration physical recording remain unmeasured.
+
 These changes do not alter the alpha gate or parity estimates below.
 
 ## Current focus
@@ -114,6 +121,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Add target five-track vocal callback allocation/PCM coverage |
 | 2026-10-15 | minor | Add measured callback allocation regressions and dynamic-delay capacity bounds |
 | 2026-10-15 | minor | Connect mobile handoff with bounded ordered rings and overload diagnostics |
 | 2026-10-15 | minor | Add prepared mixer handoff evidence and outstanding integration gates |
