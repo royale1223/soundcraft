@@ -122,6 +122,8 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
+- **2026-10-15 (prepared mixer state handoff):** The built-in-only mixer now exposes control-thread delay preparation and an ownership-only runtime-state transfer between independently prepared layouts. Reverb tails, unchanged delay histories, parameter smoothing, and compatible instrument state can survive replacement; spare/removed objects remain owned by the old mixer for control-thread retirement. Five host regressions verify exact PCM across edits, initial-path parity, parameter identity changes, rate incompatibility, and deferred plugin destruction. Playback integration with bounded ordered delivery is still pending; dynamic latency automation and clip-effect state transfer remain open. No realtime or device gate is closed.
+
 - **2026-10-15 (render workspace preparation):** Synchronization now prepares main-meter channels, send/output buffers, zero-delay channel storage, and parameter caches before the first render. Empty plugin adoption preserves that prepared layout. Parameter-name changes invalidate caches even when the parameter count and numeric values match; value-only edits preserve caches and plugin state. Host mobile-feature tests verify buffer retention, parameter application, and first-block sample parity. Structural session updates and nonzero latency changes still need callback-safe preparation; no realtime or device gate is closed.
 
 - **2026-10-15 (capture-loss diagnostics):** `Recorder::lost_samples` exposes exact interleaved sample loss for hosts that stop damaged takes promptly. Finalization now warns even when loss is smaller than a millisecond or one input frame. A terminated writer is reported both during capture and at finalization, with its partial file left for recovery. Simulated full-ring and worker-failure regressions preserve the valid WAV prefix. No physical-device or parity/readiness claim.
@@ -159,6 +161,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Add built-in prepared-mixer state handoff with tail and retirement regressions |
 | 2026-10-15 | minor | Prepare render caches and channel storage before the first block; track parameter identities |
 | 2026-10-15 | trivial | Expose exact capture loss and retain a warning for sub-millisecond/sub-frame overflow |
 | 2026-10-15 | minor | Local downstream mobile-feasibility patch; no parity estimates changed |

@@ -15,6 +15,14 @@ Empty hosted-instance adoption no longer discards an already prepared layout.
 Host regressions verify retained allocations and shared-path first-block PCM.
 This remains partial hardening: structural edits still synchronize on callbacks,
 nonzero delay changes may allocate, and physical-device deadlines are unmeasured.
+The built-in-only mixer also exposes fresh-layout compensation preparation and
+runtime ownership transfer. Exact host PCM regressions preserve reverb tails,
+compensation histories, and parameter smoothing across structural edits. Replaced
+instances remain in the retired engine. This API is not connected to playback
+yet: ordered bounded delivery and retirement must land together. Probe preparation
+temporarily holds another mixer; its control-thread cost is unmeasured. Dynamic
+latency automation and clip-effect state transfer remain open.
+
 These changes do not alter the alpha gate or parity estimates below.
 
 ## Current focus
@@ -97,6 +105,7 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Add prepared mixer handoff evidence and outstanding integration gates |
 | 2026-10-15 | minor | Record downstream first-render preparation and remaining callback gates |
 | 2026-10-10 | minor | Added the alpha gate (3 of 6 core workflows fail → pre-alpha) |
 | 2026-10-10 | major | Created from ROADMAP.md's milestones and alpha list; added M12–M17 and the beta plan with estimates |
