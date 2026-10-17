@@ -655,6 +655,8 @@ pub struct InputRing {
     rate: u32,
     /// Most samples kept: half a second of input, or 24 000 frames when the rate is unknown.
     cap: usize,
+    max_frames: AtomicUsize,
+    latest_chunk: AtomicUsize,
 }
 
 impl InputRing {
@@ -666,15 +668,42 @@ impl InputRing {
             channels: std::sync::atomic::AtomicUsize::new(ch),
             rate,
             cap: frames * ch,
+            max_frames: AtomicUsize::new(frames),
+            latest_chunk: AtomicUsize::new(0),
         })
     }
 
+    /// Bound listening backlog in input-rate frames. Call from the control thread.
+    /// Never retain less than one complete incoming callback or the reader's quantum.
+    pub fn set_max_frames(&self, frames: usize) {
+        let ch = self.channels.load(Ordering::Relaxed).max(1);
+        self.max_frames.store(frames.clamp(2, (self.cap / ch).max(2)), Ordering::Relaxed);
+    }
+
+    /// Discard stale pre-roll on the control thread before attaching the output stream.
+    pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.data.clear();
+        state.phase = 0.0;
+    }
+
     pub fn push(&self, samples: &[f32]) {
+        let ch = self.channels.load(Ordering::Relaxed).max(1);
+        let frames = samples.len() / ch;
+        self.latest_chunk.store(frames, Ordering::Relaxed);
         if let Ok(mut s) = self.state.try_lock() {
-            s.data.extend(samples.iter().copied().map(finite));
-            while s.data.len() > self.cap {
-                s.data.pop_front();
+            let cap_frames = self.max_frames.load(Ordering::Relaxed).max(frames.saturating_add(2)).min(self.cap / ch);
+            let keep = frames.min(cap_frames).saturating_mul(ch);
+            let end = frames.saturating_mul(ch);
+            let Some(tail) = samples.get(end.saturating_sub(keep)..end) else { return };
+            let discard = s.data.len().saturating_add(keep).saturating_sub(cap_frames * ch);
+            if discard > 0 {
+                // Drop whole old frames before extending: even oversized callbacks
+                // cannot grow the prepared VecDeque or leave interleaved channels skewed.
+                s.data.drain(..discard);
+                s.phase = 0.0;
             }
+            s.data.extend(tail.iter().copied().map(finite));
         }
     }
 
@@ -688,6 +717,13 @@ impl InputRing {
         let Ok(mut s) = self.state.try_lock() else { return };
         // Input frames consumed per output frame.
         let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
+        let needed = (frames as f64 * step).ceil() as usize + 2;
+        let keep_frames = self.max_frames.load(Ordering::Relaxed).max(self.latest_chunk.load(Ordering::Relaxed)).max(needed);
+        let discard_frames = (s.data.len() / ch).saturating_sub(keep_frames);
+        if discard_frames > 0 {
+            s.data.drain(..discard_frames * ch);
+            s.phase = 0.0;
+        }
         for f in 0..frames {
             // Drop input frames we have moved past; keep the one at `phase` and the next one.
             while s.phase >= 1.0 && s.data.len() >= 2 * ch {
@@ -775,5 +811,26 @@ mod ring_tests {
         let mut out = vec![vec![1.0f32; 4]];
         ring.pop_into(&mut out, 4, 48_000);
         assert_eq!(out[0], [0.5, 0.0, 0.0, -0.5]);
+    }
+    #[test]
+    fn low_latency_ring_drops_old_frames_and_keeps_channel_alignment_without_allocating() {
+        let ring = InputRing::new(2, 48000);
+        ring.set_max_frames(4);
+        ring.push(&[1.0, 11.0, 2.0, 12.0, 3.0, 13.0, 4.0, 14.0]);
+        ring.push(&[5.0, 15.0, 6.0, 16.0, 7.0, 17.0, 8.0, 18.0]);
+        let mut out = vec![vec![0.0; 2]; 2];
+        ring.pop_into(&mut out, 2, 48000);
+        assert_eq!(out[0], vec![5.0, 6.0]);
+        assert_eq!(out[1], vec![15.0, 16.0]);
+        let large = vec![0.25; 100_000];
+        let measured = allocation_counter::measure(|| {
+            ring.push(&large);
+            ring.pop_into(&mut out, 2, 48000);
+        });
+        assert_eq!(measured.count_total, 0);
+        assert_eq!(measured.count_current, 0);
+        ring.clear();
+        ring.pop_into(&mut out, 2, 48000);
+        assert_eq!(out, vec![vec![0.0; 2]; 2]);
     }
 }

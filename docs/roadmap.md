@@ -1,10 +1,22 @@
 # SoundCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-17 · **Change:** minor (downstream render preparation; alpha gate unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream dry input monitoring and atomic monitor controls; alpha gate unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
 Hours are Opus 5.5 agent-hours.
+
+## Downstream input monitoring (2026-10-18)
+
+Player monitor gain and rack choice are atomic control-side settings. The mixer
+ramps monitor gain after inserts, independently of stored track gain, and offers
+a dry path that skips inserts and compensation waits on live input strips.
+InputRing can retain a small requested number of frames and discard stale
+monitor backlog without changing the separate disk-capture queue. Its callback
+uses try-locks and preallocated storage; no blocking mutex was introduced.
+Host regressions cover channel alignment, bounded storage, monitor gain and
+PDC bypass. Device round-trip latency, underruns and route behavior still need
+physical-device measurements; hardware gap G-01 and parity metrics remain open.
 
 ## Downstream mobile preparation
 

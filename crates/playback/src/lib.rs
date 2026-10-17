@@ -141,6 +141,8 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     output_clip_events: AtomicU32,
+    monitor_gain: AtomicU32,
+    monitor_use_rack: AtomicBool,
     meters: Mutex<MeterSnapshot>,
 }
 
@@ -493,6 +495,8 @@ impl AudioState {
         } else {
             self.mix.input_channels = 0;
         }
+        self.mix.monitor_gain = f32::from_bits(self.shared.monitor_gain.load(Ordering::Relaxed));
+        self.mix.monitor_use_rack = self.shared.monitor_use_rack.load(Ordering::Relaxed);
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending[..self.pending_channels]);
@@ -700,6 +704,8 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -933,6 +939,17 @@ impl Player {
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
         let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    /// Set post-insert listening gain without rebuilding DSP or queuing an audio command.
+    pub fn set_monitor_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 0.0 };
+        self.shared.monitor_gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Include the track's inserts in live input monitoring (false is a dry listen).
+    pub fn set_monitor_use_rack(&self, enabled: bool) {
+        self.shared.monitor_use_rack.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_recording(&self, on: bool) {
@@ -1247,6 +1264,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let mut source = HashMap::new();
@@ -1267,6 +1286,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         };
 
@@ -1290,6 +1311,8 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let fault = Fault::default();
@@ -1332,6 +1355,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1351,6 +1376,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1373,6 +1400,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let guard = shared.meters.lock().unwrap();
@@ -1396,6 +1425,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1421,6 +1452,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1456,6 +1489,8 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1486,6 +1521,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1518,6 +1555,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1537,6 +1576,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1563,6 +1604,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1607,6 +1650,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1703,6 +1748,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1733,6 +1780,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1769,6 +1818,8 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 output_clip_events: AtomicU32::new(0),
+                monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+                monitor_use_rack: AtomicBool::new(true),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             let (tx, rx) = test_channel();
@@ -1800,6 +1851,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &s);
@@ -1842,6 +1895,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -1905,6 +1960,8 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
@@ -1943,6 +2000,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -2006,6 +2065,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -2102,6 +2163,8 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 output_clip_events: AtomicU32::new(0),
+                monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+                monitor_use_rack: AtomicBool::new(true),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             prepare_meter_layout(&shared, &session);

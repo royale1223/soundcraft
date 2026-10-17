@@ -257,6 +257,8 @@ struct Strip {
     chase: bool,
     muted: bool,
     gr: f32,
+    monitor_gain: Option<f32>,
+    monitored: bool,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     clip_fx: HashMap<u64, ClipFx>,
     clipbuf: Vec<Vec<f32>>,
@@ -353,6 +355,8 @@ impl Strip {
             chase: true,
             muted: false,
             gr: 0.0,
+            monitor_gain: None,
+            monitored: false,
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
             latency: 0,
@@ -400,6 +404,10 @@ pub struct MixEngine {
     pub input_channels: usize,
     /// Transport stopped: only monitored inputs sound (no clips).
     pub monitor_only: bool,
+    /// Post-insert listening gain for live microphone strips only; never recorded or bounced.
+    pub monitor_gain: f32,
+    /// Process inserts on live input. Disable for a dry, minimum-algorithmic-latency listen.
+    pub monitor_use_rack: bool,
     /// Recording: record-armed tracks hear their input (auto input).
     pub recording: bool,
     /// Mix the metronome (Options > Click) into the output. Playback turns this on; offline renders
@@ -488,6 +496,8 @@ impl MixEngine {
             input: Vec::new(),
             input_channels: 0,
             monitor_only: false,
+            monitor_gain: 1.0,
+            monitor_use_rack: true,
             recording: false,
             metronome: false,
             external: false,
@@ -742,7 +752,13 @@ impl MixEngine {
         let empty_busses = HashMap::with_hasher(self.busses.hasher().clone());
         let busses = std::mem::replace(&mut self.busses, empty_busses);
         let live_input = self.input.get(..self.input_channels.min(self.input.len())).unwrap_or(&[]);
-        let live_in = LiveInput { input: live_input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_in = LiveInput {
+            input: live_input,
+            monitor_only: self.monitor_only,
+            recording: self.recording,
+            gain: self.monitor_gain,
+            use_rack: self.monitor_use_rack,
+        };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -792,10 +808,11 @@ impl MixEngine {
         for (i, st) in work.iter_mut() {
             let Some(t) = s.tracks.get(*i) else { continue };
             let ch = st.buf.len();
-            st.align.set(lmax_t.saturating_sub(st.latency), ch);
+            let delay = if st.monitored { 0 } else { lmax_t.saturating_sub(st.latency) };
+            st.align.set(delay, ch);
             st.align.process(&mut st.buf, frames);
             if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
-                st.align_pre.set(lmax_t.saturating_sub(st.latency), ch);
+                st.align_pre.set(delay, ch);
                 st.align_pre.process(&mut st.pre, frames);
             }
             let waits = match &t.mixer.output {
@@ -803,7 +820,7 @@ impl MixEngine {
                 Route::Bus(b) => self.aux_fed.contains(b),
                 _ => false,
             };
-            st.out_extra.set(if waits { lmax_a } else { 0 }, ch);
+            st.out_extra.set(if waits && !st.monitored { lmax_a } else { 0 }, ch);
         }
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
@@ -824,7 +841,13 @@ impl MixEngine {
                 st.scratch.resize(self.max_block, 0.0);
             }
             let live_input = self.input.get(..self.input_channels.min(self.input.len())).unwrap_or(&[]);
-            let live_in = LiveInput { input: live_input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_in = LiveInput {
+                input: live_input,
+                monitor_only: self.monitor_only,
+                recording: self.recording,
+                gain: self.monitor_gain,
+                use_rack: self.monitor_use_rack,
+            };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -989,6 +1012,8 @@ impl MixEngine {
 /// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
 /// Live input routed to monitored tracks.
 struct LiveInput<'a> {
+    gain: f32,
+    use_rack: bool,
     input: &'a [Vec<f32>],
     monitor_only: bool,
     recording: bool,
@@ -1008,8 +1033,12 @@ fn process_strip(
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
     }
     let transport = transport_at(s, pos, !live.monitor_only, live.recording);
+    let monitored = t.kind == TrackKind::Audio
+        && !live.input.is_empty()
+        && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording)));
+    strip.monitored = monitored;
     match t.kind {
-        TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
+        TrackKind::Audio if monitored => {
             // Input monitoring: the track hears its hardware input instead of its clips.
             let first = match &t.mixer.input {
                 Route::Hardware(h) => {
@@ -1122,6 +1151,9 @@ fn process_strip(
     let mut gr = 0.0f32;
     let mut latency = 0usize;
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        if monitored && !live.use_rack {
+            break;
+        }
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
             continue;
@@ -1176,10 +1208,14 @@ fn process_strip(
         }
     }
     let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0.min(12.0), v1.min(12.0)) };
+    let monitor_end = if monitored && live.gain.is_finite() { live.gain.clamp(0.0, 4.0) } else { 1.0 };
+    let monitor_start = if monitored { strip.monitor_gain.unwrap_or(monitor_end) } else { 1.0 };
+    strip.monitor_gain = if monitored { Some(monitor_end) } else { None };
     for c in strip.buf.iter_mut() {
         for i in 0..frames {
             if let Some(x) = c.get_mut(i) {
-                *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1));
+                let t = if frames > 1 { i as f32 / (frames - 1) as f32 } else { 1.0 };
+                *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1)) * (monitor_start + (monitor_end - monitor_start) * t);
             }
         }
     }
@@ -3546,5 +3582,64 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+    #[test]
+    fn dry_monitor_skips_insert_latency_and_other_tracks_compensation() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        s.edit.click = false;
+        let monitored = s.track_mut(t).unwrap();
+        monitored.mixer.input_monitor = true;
+        monitored.mixer.pan = vec![-1.0];
+        let mut comp = Insert::new("compressor");
+        comp.params.insert("lookahead".into(), 10.0);
+        monitored.mixer.inserts[0] = Some(comp.clone());
+        let other = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.track_mut(other).unwrap().mixer.inserts[0] = Some(comp);
+        let mut mix = MixEngine::new(48000.0, 512);
+        mix.monitor_use_rack = false;
+        mix.input = vec![vec![0.25; 512]];
+        mix.input_channels = 1;
+        let mut out = vec![vec![0.0; 512]; 2];
+        mix.render(&s, 0, 512, &mut out);
+        assert!(mix.latency > 0, "other track still has processing latency");
+        assert!((out[0][0] - 0.25).abs() < 1e-6, "live mic must not wait for either insert/PDC delay");
+        let mut expected = vec![vec![0.0; 512]; 2];
+        MixEngine::new(48000.0, 512).render(&s, 0, 512, &mut expected);
+        let mut offline = MixEngine::new(48000.0, 512);
+        offline.monitor_use_rack = false;
+        offline.monitor_gain = 0.0;
+        offline.render(&s, 0, 512, &mut out);
+        assert_eq!(out, expected, "monitor options never affect clip playback/export");
+    }
+
+    #[test]
+    fn monitor_gain_is_post_insert_and_changes_ramp_without_allocating() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        s.edit.click = false;
+        let track = s.track_mut(t).unwrap();
+        track.mixer.input_monitor = true;
+        let mut comp = Insert::new("compressor");
+        comp.params.insert("threshold".into(), -30.0);
+        comp.params.insert("ratio".into(), 8.0);
+        track.mixer.inserts[0] = Some(comp);
+        let mut full = MixEngine::new(48000.0, 512);
+        full.input = vec![vec![0.25; 512]];
+        full.input_channels = 1;
+        let mut half = MixEngine::new(48000.0, 512);
+        half.input = full.input.clone();
+        half.input_channels = 1;
+        half.monitor_gain = 0.5;
+        let mut a = vec![vec![0.0; 512]; 2];
+        let mut b = a.clone();
+        full.render(&s, 0, 512, &mut a);
+        half.render(&s, 0, 512, &mut b);
+        for (a, b) in a.iter().flatten().zip(b.iter().flatten()) {
+            assert!((*b - *a * 0.5).abs() < 1e-6);
+        }
+        assert_eq!(full.meters[&t].gain_reduction_db, half.meters[&t].gain_reduction_db);
+        half.monitor_gain = 0.0;
+        half.render(&s, 512, 512, &mut b);
+        assert!(b[0][0].abs() > b[0][511].abs());
+        assert_eq!(b[0][511], 0.0);
     }
 }
