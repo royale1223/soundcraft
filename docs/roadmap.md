@@ -135,3 +135,10 @@ Optional serialized strip balance attenuates stereo output columns after inserts
 and panning on the shared realtime/offline path. Default zero preserves existing
 sessions and dual-panner behavior; LiteDAW uses hard L/R panners plus balance.
 No callback allocation or parity metric changes.
+
+## Downstream waveform RMS ranges (2026-10-17)
+
+Added a bounded, cached RMS range query for integer sample intervals. LiteDAW
+uses exact rational raster boundaries to avoid float-step inclusion of a sample
+from the preceding bin. Existing floating-span callers retain their semantics.
+Parity metrics unchanged.

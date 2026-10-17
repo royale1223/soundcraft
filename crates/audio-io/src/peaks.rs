@@ -78,6 +78,17 @@ impl Peaks {
         self.sum(samples, start, end).range()
     }
 
+    /// RMS over `[start, end)`, clamped to the overview and sample data.
+    /// An empty/reversed range returns zero; cached sums preserve logarithmic queries.
+    pub fn rms_range(&self, samples: &[f32], start: usize, end: usize) -> f32 {
+        let end = end.min(self.len).min(samples.len());
+        let count = end.saturating_sub(start);
+        if count == 0 {
+            return 0.0;
+        }
+        (self.sum(samples, start, end).squares / count as f32).sqrt()
+    }
+
     fn sum(&self, samples: &[f32], start: usize, end: usize) -> Block {
         let end = end.min(self.len).min(samples.len());
         let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
@@ -146,7 +157,7 @@ impl Peaks {
             .map(|w| {
                 w.map(|(a, b)| {
                     let (s, e) = (a.floor() as usize, (b.ceil() as usize).saturating_add(1).min(self.len).min(samples.len()));
-                    (self.sum(samples, s, e).squares / e.saturating_sub(s).max(1) as f32).sqrt()
+                    self.rms_range(samples, s, e)
                 })
             })
             .collect()
@@ -164,6 +175,19 @@ mod tests {
 
     fn signal(n: usize) -> Vec<f32> {
         (0..n).map(|i| ((i as f32 * 0.037).sin() * (i as f32 * 0.0011).cos()) + if i % 997 == 0 { 0.5 } else { 0.0 }).collect()
+    }
+
+    #[test]
+    fn rms_range_clamps_and_handles_empty_or_reversed_ranges() {
+        let samples = [1.0, -2.0, 3.0, -4.0];
+        let peaks = Peaks::build(&samples);
+        assert!((peaks.rms_range(&samples, 1, 3) - 6.5_f32.sqrt()).abs() < 1e-6);
+        assert!((peaks.rms_range(&samples, 2, usize::MAX) - 12.5_f32.sqrt()).abs() < 1e-6);
+        assert_eq!(peaks.rms_range(&samples, 2, 2), 0.0);
+        assert_eq!(peaks.rms_range(&samples, 3, 1), 0.0);
+        assert_eq!(peaks.rms_range(&samples, usize::MAX, usize::MAX), 0.0);
+        assert_eq!(peaks.rms_range(&samples[..2], 2, 4), 0.0);
+        assert_eq!(Peaks::default().rms_range(&[], 0, 10), 0.0);
     }
 
     #[test]
