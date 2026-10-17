@@ -498,6 +498,10 @@ pub struct Mixer {
     pub volume_db: f32,
     /// One panner per source channel for mono/stereo (stereo tracks: two panners, default hard L/R).
     pub pan: Vec<f32>,
+    /// Stereo output balance after panning: -1 left, 0 unchanged, +1 right.
+    /// Attenuates the opposite output only; ignored for non-stereo sources/destinations.
+    #[serde(default)]
+    pub stereo_balance: f32,
     pub mute: bool,
     pub solo: bool,
     #[serde(default)]
@@ -534,6 +538,7 @@ impl Mixer {
         Mixer {
             volume_db: 0.0,
             pan,
+            stereo_balance: 0.0,
             mute: false,
             solo: false,
             solo_safe: false,
@@ -557,6 +562,7 @@ impl Mixer {
         for p in &mut self.pan {
             *p = finite_or(*p, 0.0).clamp(-1.0, 1.0);
         }
+        self.stereo_balance = finite_or(self.stereo_balance, 0.0).clamp(-1.0, 1.0);
         self.inserts.resize(INSERT_SLOTS, None);
         self.sends.resize(SEND_SLOTS, None);
         for s in self.sends.iter_mut().flatten() {
@@ -671,6 +677,20 @@ mod tests {
         m.sanitize();
         assert_eq!(m.volume_db, 0.0);
         assert_eq!(m.inserts.len(), INSERT_SLOTS);
+    }
+
+    #[test]
+    fn stereo_balance_is_optional_and_sanitized() {
+        let mut m = Mixer::new(ChannelFormat::Stereo);
+        let mut legacy = serde_json::to_value(&m).unwrap();
+        legacy.as_object_mut().unwrap().remove("stereo_balance");
+        let restored: Mixer = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.stereo_balance, 0.0);
+        for (value, expected) in [(2.0, 1.0), (-2.0, -1.0), (f32::NAN, 0.0), (f32::INFINITY, 0.0)] {
+            m.stereo_balance = value;
+            m.sanitize();
+            assert_eq!(m.stereo_balance, expected);
+        }
     }
 
     #[test]

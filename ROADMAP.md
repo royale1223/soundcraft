@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (downstream master and per-track overload telemetry; parity metrics unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-17 · **Change:** minor (downstream master and per-track overload telemetry; parity metrics unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -190,3 +190,10 @@ mutated and truncated movies. Field reports from the first public week are track
 | 2026-10-10 | major | Rewritten to the progress-docs standard: stage alpha (re-normalized the same day), two numbers (breadth ~70 %, ready ~40 %), dimension/feature/language tables, hours re-calibrated; area table moved to docs/target-app-parity.md, milestones to docs/roadmap.md |
 | 2026-10-07 | major | Menu parity 94 %, ~65 % estimated feature parity, alpha list |
 | 2026-10-06 | minor | Alpha and parity estimates |
+
+## Downstream stereo balance (2026-10-17)
+
+Optional serialized strip balance attenuates stereo output columns after inserts
+and panning on the shared realtime/offline path. Default zero preserves existing
+sessions and dual-panner behavior; LiteDAW uses hard L/R panners plus balance.
+No callback allocation or parity metric changes.

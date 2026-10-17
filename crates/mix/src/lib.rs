@@ -970,7 +970,15 @@ impl MixEngine {
         while start < frames {
             let (at, end) = pan_segment(t, pos, start, frames);
             let spec = PanSpec { stereo: [pan_at(t, 0, at), pan_at(t, 1, at)], surround: t.mixer.surround.as_ref() };
-            let m = build_matrix(src_fmt, src.len(), dst_fmt, dst.len(), &spec, law);
+            let mut m = build_matrix(src_fmt, src.len(), dst_fmt, dst.len(), &spec, law);
+            if src_fmt == ChannelFormat::Stereo && dst_fmt == ChannelFormat::Stereo {
+                let balance = if t.mixer.stereo_balance.is_finite() { t.mixer.stereo_balance.clamp(-1.0, 1.0) } else { 0.0 };
+                // Scale output columns, preserving channel identity for hard L/R panners.
+                for row in &mut m {
+                    row[0] *= (1.0 - balance).min(1.0);
+                    row[1] *= (1.0 + balance).min(1.0);
+                }
+            }
             apply_matrix_span(src, start..end, dst, &m, 1.0);
             start = end;
         }
@@ -2466,6 +2474,23 @@ mod tests {
             pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
         }
         t
+    }
+
+    #[test]
+    fn stereo_balance_attenuates_without_crossfeed_or_boost() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let frames = 4800;
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.8; frames], vec![0.4; frames]] };
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(buf)));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "stereo", SourceId(900), 0, 0, frames as i64));
+        for (balance, left, right) in [(-1.0, 0.8, 0.0), (-0.5, 0.8, 0.2), (0.0, 0.8, 0.4), (0.5, 0.4, 0.4), (1.0, 0.0, 0.4), (f32::NAN, 0.8, 0.4)] {
+            s.track_mut(t).unwrap().mixer.stereo_balance = balance;
+            let out = render_range(&s, Range::new(0, frames as i64), 512);
+            assert!((out[0][1000] - left).abs() < 1e-6, "balance {balance}");
+            assert!((out[1][1000] - right).abs() < 1e-6, "balance {balance}");
+        }
     }
 
     #[test]
