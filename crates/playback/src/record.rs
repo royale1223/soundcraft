@@ -650,6 +650,8 @@ struct RingState {
 /// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
 pub struct InputRing {
     state: Mutex<RingState>,
+    /// Callback-owned envelope, published without taking the monitor/overview lock.
+    peaks: Box<[AtomicU32]>,
     pub channels: std::sync::atomic::AtomicUsize,
     /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
     rate: u32,
@@ -664,6 +666,7 @@ impl InputRing {
         let ch = channels.max(1);
         let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
         Arc::new(InputRing {
+            peaks: (0..ch).map(|_| AtomicU32::new(0)).collect(),
             state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
             rate,
@@ -690,6 +693,15 @@ impl InputRing {
     pub fn push(&self, samples: &[f32]) {
         let ch = self.channels.load(Ordering::Relaxed).max(1);
         let frames = samples.len() / ch;
+        // Fast attack and 24 dB/s release at the actual input rate. A short
+        // transient survives UI sampling, even when the monitor ring is busy.
+        let rate = if self.rate == 0 { 48_000 } else { self.rate };
+        let release = 10.0_f32.powf(-24.0 * frames as f32 / rate as f32 / 20.0);
+        for (channel, peak) in self.peaks.iter().enumerate().take(ch) {
+            let latest = samples.iter().skip(channel).step_by(ch).fold(0.0_f32, |max, sample| max.max(finite(*sample).abs()));
+            let previous = f32::from_bits(peak.load(Ordering::Relaxed));
+            peak.store(latest.max(previous * release).to_bits(), Ordering::Relaxed);
+        }
         self.latest_chunk.store(frames, Ordering::Relaxed);
         if let Ok(mut s) = self.state.try_lock() {
             let cap_frames = self.max_frames.load(Ordering::Relaxed).max(frames.saturating_add(2)).min(self.cap / ch);
@@ -705,6 +717,11 @@ impl InputRing {
             }
             s.data.extend(tail.iter().copied().map(finite));
         }
+    }
+
+    /// Control-thread metering only; does not drain recording or monitoring audio.
+    pub fn input_peaks(&self) -> Vec<f32> {
+        self.peaks.iter().map(|peak| f32::from_bits(peak.load(Ordering::Relaxed))).collect()
     }
 
     /// Fill `out` (planar, at `session_rate`) with up to `frames` frames, converting from the
@@ -749,6 +766,19 @@ impl InputRing {
 #[cfg(test)]
 mod ring_tests {
     use super::InputRing;
+
+    #[test]
+    fn capture_peak_envelope_survives_a_busy_monitor_and_releases_in_input_time() {
+        let ring = InputRing::new(2, 48_000);
+        let lock = ring.state.lock().unwrap();
+        ring.push(&[0.8, -0.4, f32::NAN, f32::INFINITY]);
+        assert_eq!(ring.input_peaks(), vec![0.8, 0.4]);
+        drop(lock);
+        ring.push(&vec![0.0; 48_000 * 2]);
+        let peaks = ring.input_peaks();
+        assert!((peaks[0] - 0.8 * 10.0_f32.powf(-24.0 / 20.0)).abs() < 1e-6);
+        assert!((peaks[1] - peaks[0] / 2.0).abs() < 1e-6);
+    }
 
     /// A 1 kHz sine recorded at 16 kHz must come out as a 1 kHz sine at 48 kHz, across calls.
     #[test]

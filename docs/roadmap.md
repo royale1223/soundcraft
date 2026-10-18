@@ -1,6 +1,11 @@
 # SoundCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream 0.8.0 merge, Rust 1.95 minimum and mobile output safety controls; parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream mobile input-meter envelope and output safety controls; parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+
+The mobile fork publishes per-input peak envelopes from the capture callback
+through preallocated atomics. Meter reads avoid the waveform overview mutex and
+retain short input transients with input-rate-based 24 dB/s release. This does
+not change the recorded audio. Physical-device responsiveness remains unmeasured.
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
