@@ -1,6 +1,6 @@
 # SoundCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream dry input monitoring and atomic monitor controls; alpha gate unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream 0.8.0 merge and Rust 1.95 minimum; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
@@ -154,3 +154,12 @@ Added a bounded, cached RMS range query for integer sample intervals. LiteDAW
 uses exact rational raster boundaries to avoid float-step inclusion of a sample
 from the preceding bin. Existing floating-span callers retain their semantics.
 Parity metrics unchanged.
+
+## Downstream 0.8.0 integration (2026-10-18)
+
+Merged upstream v0.8.0 while preserving all mobile callback preparation, bounded
+queues/capture reporting, DSP-state handoffs, monitoring/metering and feature gates.
+The import-video merge retains the mobile video feature gate and initializes the
+new offline-reason field. Stored-path/ProRes fixes are retained for enabled paths.
+Workspace MSRV is 1.95 to match mandatory craft-docpath. No parity metrics or
+product-readiness gates changed. Validation is recorded in LiteDAW plan.md.

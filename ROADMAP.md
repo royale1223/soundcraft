@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream bounded low-latency input monitoring and independent monitor gain; parity metrics unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream 0.8.0 merge and Rust 1.95 minimum; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -204,3 +204,12 @@ Added a bounded, cached RMS range query for integer sample intervals. LiteDAW
 uses exact rational raster boundaries to avoid float-step inclusion of a sample
 from the preceding bin. Existing floating-span callers retain their semantics.
 Parity metrics unchanged.
+
+## Downstream 0.8.0 integration (2026-10-18)
+
+Merged upstream v0.8.0 while preserving all mobile callback preparation, bounded
+queues/capture reporting, DSP-state handoffs, monitoring/metering and feature gates.
+The import-video merge retains the mobile video feature gate and initializes the
+new offline-reason field. Stored-path/ProRes fixes are retained for enabled paths.
+Workspace MSRV is 1.95 to match mandatory craft-docpath. No parity metrics or
+product-readiness gates changed. Validation is recorded in LiteDAW plan.md.
