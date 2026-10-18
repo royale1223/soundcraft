@@ -598,25 +598,28 @@ impl AudioState {
             self.pending_len = BLOCK;
             return;
         }
+        let monitor_gain = f32::from_bits(self.shared.monitor_gain.load(Ordering::Relaxed));
+        let monitor_enabled = self.shared.direct_monitor_enabled.load(Ordering::Relaxed) && monitor_gain > 0.0;
         if let Some(ring) = &self.input {
             let ch = ring.channels.load(Ordering::Relaxed).max(1).min(self.mix.input.len());
             self.mix.input_channels = ch;
             ring.pop_into(&mut self.mix.input[..ch], n, self.session.sample_rate.hz());
-            let active = self.shared.feedback_protection.load(Ordering::Relaxed) && self.session.tracks.iter().any(|t| t.mixer.input_monitor);
+            let active = monitor_enabled
+                && self.shared.feedback_protection.load(Ordering::Relaxed)
+                && self.session.tracks.iter().any(|t| t.mixer.input_monitor);
             self.feedback_guard.update(&self.mix.input[..ch], n, self.session.sample_rate.hz(), active);
         } else {
             self.mix.input_channels = 0;
             self.feedback_guard.update(&[], 0, 1, false);
         }
-        let monitor_gain = f32::from_bits(self.shared.monitor_gain.load(Ordering::Relaxed));
-        self.mix.monitor_gain = if !self.shared.direct_monitor_enabled.load(Ordering::Relaxed) {
+        self.mix.monitor_gain = if !monitor_enabled {
             0.0
         } else if self.shared.feedback_protection.load(Ordering::Relaxed) {
             monitor_gain * self.feedback_guard.gain
         } else {
             monitor_gain
         };
-        self.mix.monitor_use_rack = self.shared.monitor_use_rack.load(Ordering::Relaxed);
+        self.mix.monitor_use_rack = monitor_enabled && self.shared.monitor_use_rack.load(Ordering::Relaxed);
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending[..self.pending_channels]);
@@ -2420,6 +2423,92 @@ mod tests {
                 timings[CALLBACKS - 1]
             );
         }
+    }
+
+    #[cfg(not(feature = "plugin-hosts"))]
+    #[test]
+    fn three_playing_tracks_with_dm_off_skip_monitor_rack_and_feedback_without_allocating() {
+        use soundcraft_model::{ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackKind};
+        const FRAMES: usize = 128;
+        const BLOCKS: usize = 128;
+        let mut session = Session::default();
+        session.edit.click = false;
+        for index in 0..3 {
+            let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+            let source = SourceId(session.alloc());
+            let signal = (0..FRAMES * BLOCKS).map(|i| (i as f32 * (0.03 + index as f32 * 0.01)).sin() * 0.1).collect();
+            session.pool.insert(source, Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+            let clip_id = session.new_clip_id();
+            session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(
+                clip_id,
+                "playing",
+                source,
+                0,
+                0,
+                (FRAMES * BLOCKS) as i64,
+            ));
+        }
+        let capture = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let track = session.track_mut(capture).unwrap();
+        track.mixer.input_monitor = true;
+        let mut compressor = Insert::new("compressor");
+        compressor.params.insert("lookahead".into(), 20.0);
+        track.mixer.inserts[0] = Some(compressor);
+        session.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(true),
+            speed: AtomicU32::new(1000),
+            output_clip_events: AtomicU32::new(0),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(false),
+            feedback_protection: AtomicBool::new(true),
+            speaker_protection: AtomicBool::new(false),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        prepare_meter_layout(&shared, &session);
+        let (_tx, rx) = channel();
+        let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+        state.playing = true;
+        state.recording = true;
+        let input = record::InputRing::new(1, 48_000);
+        state.input = Some(Arc::clone(&input));
+        let mic: Vec<_> = (0..FRAMES).map(|i| (i as f32 * std::f32::consts::TAU * 4.0 / FRAMES as f32).sin() * 0.95).collect();
+        let mut out = vec![0.0; FRAMES * 2];
+        let mut expected = vec![vec![0.0; FRAMES]; 2];
+        let mut reference = MixEngine::new(48_000.0, BLOCK);
+        let mut expected_session = session.clone();
+        expected_session.track_mut(capture).unwrap().mixer.inserts[0] = None;
+        let mut max_us = 0;
+        for block in 0..BLOCKS {
+            input.push(&mic);
+            let started = std::time::Instant::now();
+            let allocations = allocation_counter::measure(|| state.fill(&mut out, 2));
+            max_us = max_us.max(started.elapsed().as_micros());
+            reference.render(&expected_session, (block * FRAMES) as i64, FRAMES, &mut expected);
+            for (i, frame) in out.chunks_exact(2).enumerate() {
+                assert_eq!(frame, &[expected[0][i], expected[1][i]], "muted monitor must not change backing playback");
+            }
+            assert_eq!(allocations.count_total, 0);
+            assert_eq!(allocations.count_current, 0);
+            assert!(!state.mix.monitor_use_rack);
+            assert_eq!(state.feedback_guard.previous_rms, 0.0);
+        }
+        assert_eq!(input.input_peaks().len(), 1, "capture metering continues with DM off");
+        shared.direct_monitor_enabled.store(true, Ordering::Relaxed);
+        input.push(&mic);
+        let on = allocation_counter::measure(|| state.fill(&mut out, 2));
+        assert_eq!(on.count_total, 0);
+        assert_eq!(on.count_current, 0);
+        assert!(state.mix.monitor_use_rack, "DM can turn back on without rebuilding the player");
+        assert!(state.feedback_guard.previous_rms > 0.2);
+        shared.monitor_gain.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        input.push(&mic);
+        state.fill(&mut out, 2);
+        assert!(!state.mix.monitor_use_rack, "a zero monitor level also skips the rack");
+        assert_eq!(state.feedback_guard.previous_rms, 0.0);
+        eprintln!("three_track_dm_off callbacks={BLOCKS} frames={FRAMES} max_us={max_us} allocations=0 frees=0");
     }
 
     #[test]
