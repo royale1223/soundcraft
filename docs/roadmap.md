@@ -1,6 +1,6 @@
 # SoundCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream 0.8.0 merge and Rust 1.95 minimum; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream 0.8.0 merge, Rust 1.95 minimum and mobile output safety controls; parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Forward-looking plan. Status and numbers: [`../ROADMAP.md`](../ROADMAP.md) and
 [`target-app-parity.md`](target-app-parity.md); the ranked work list: [`gaps.md`](gaps.md).
@@ -17,6 +17,18 @@ uses try-locks and preallocated storage; no blocking mutex was introduced.
 Host regressions cover channel alignment, bounded storage, monitor gain and
 PDC bypass. Device round-trip latency, underruns and route behavior still need
 physical-device measurements; hardware gap G-01 and parity metrics remain open.
+
+## Downstream mobile monitoring protection (2026-10-18)
+
+The LiteDAW mobile fork adds an atomic direct-monitor power switch that retains
+the saved monitor gain, a callback-owned narrowband detector that ducks a
+sustained resonant monitor input, and an optional device-output limiter with a
+−1 dBFS sample ceiling. The detector only changes the live monitor send; capture
+and offline render audio are untouched. The limiter is a device-output guard,
+separate from the existing insertable compressor/limiter plugin. These are
+downstream mobile changes, not general SoundCraft parity claims; acoustic
+feedback behavior and speaker protection still need physical device/speaker
+measurements.
 
 ## Downstream mobile preparation
 

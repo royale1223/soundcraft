@@ -143,6 +143,9 @@ struct Shared {
     output_clip_events: AtomicU32,
     monitor_gain: AtomicU32,
     monitor_use_rack: AtomicBool,
+    direct_monitor_enabled: AtomicBool,
+    feedback_protection: AtomicBool,
+    speaker_protection: AtomicBool,
     meters: Mutex<MeterSnapshot>,
 }
 
@@ -242,12 +245,117 @@ struct AudioState {
     fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
     read: f64,
+    speaker_guard: SpeakerGuard,
+    feedback_guard: FeedbackGuard,
     device_rate: f64,
     input: Option<Arc<record::InputRing>>,
     recording: bool,
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: SyncSender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<ReturnSender<RetiredSession>>,
+}
+
+/// Callback-owned conservative detector for a loud, persistent near-sine input.
+/// It ducks only the live monitor send; capture samples remain untouched.
+#[derive(Default)]
+struct FeedbackGuard {
+    hot_blocks: u16,
+    gain: f32,
+    previous_rms: f32,
+}
+
+impl FeedbackGuard {
+    fn update(&mut self, input: &[Vec<f32>], frames: usize, sample_rate: u32, active: bool) -> f32 {
+        if active && frames >= 32 {
+            let rms = input
+                .iter()
+                .filter_map(|channel| channel.get(..frames))
+                .map(|samples| {
+                    let energy = samples.iter().map(|sample| f64::from(*sample) * f64::from(*sample)).sum::<f64>();
+                    (energy / frames as f64).sqrt() as f32
+                })
+                .fold(0.0f32, f32::max);
+            let narrowband = input.iter().any(|channel| resonant_input(channel, frames, sample_rate));
+            let rising_or_excessive = rms > 0.2 && (rms > self.previous_rms * 1.04 || rms > 0.8);
+            self.previous_rms = rms;
+            if narrowband && rising_or_excessive {
+                self.hot_blocks = self.hot_blocks.saturating_add(1);
+                if self.hot_blocks >= 8 {
+                    self.gain = (self.gain * 0.72).max(0.125);
+                }
+            } else {
+                self.hot_blocks = 0;
+                self.gain = (self.gain + 0.02).min(1.0);
+            }
+        } else {
+            self.hot_blocks = 0;
+            self.previous_rms = 0.0;
+            self.gain = (self.gain + 0.02).min(1.0);
+        }
+        self.gain
+    }
+}
+
+/// Per-sample device-output ceiling with an immediate attack and a 50 ms release.
+#[derive(Clone, Copy)]
+struct SpeakerGuard {
+    gain: f32,
+}
+
+impl SpeakerGuard {
+    const CEILING: f32 = 0.891_250_9; // −1 dBFS
+
+    fn process(&mut self, frame: &mut [f32], sample_rate: f64, enabled: bool) {
+        if enabled {
+            let peak = frame.iter().fold(0.0f32, |p, sample| p.max(sample.abs()));
+            if peak > Self::CEILING {
+                self.gain = (Self::CEILING / peak).min(self.gain);
+            } else {
+                let release = (1.0 / (sample_rate * 0.05).max(1.0)) as f32;
+                self.gain = (self.gain + (1.0 - self.gain) * release).min(1.0);
+            }
+            for sample in frame {
+                *sample = (*sample * self.gain).clamp(-Self::CEILING, Self::CEILING);
+            }
+        } else {
+            for sample in frame {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
+/// Detect whether one narrow frequency bin dominates a loud monitor input. The bounded
+/// Goertzel scan uses no scratch allocation and only checks roughly 200 Hz–4 kHz.
+fn resonant_input(samples: &[f32], frames: usize, sample_rate: u32) -> bool {
+    let Some(samples) = samples.get(..frames) else {
+        return false;
+    };
+    let sum_sq = samples.iter().map(|sample| f64::from(*sample) * f64::from(*sample)).sum::<f64>();
+    let rms = (sum_sq / frames as f64).sqrt();
+    if rms < 0.2 {
+        return false;
+    }
+    let mut dominant = 0.0f64;
+    let rate = f64::from(sample_rate.max(1));
+    let first_bin = ((200.0 * frames as f64 / rate).ceil() as usize).max(1);
+    let last_bin = ((4_000.0 * frames as f64 / rate).floor() as usize).min(frames / 2);
+    if first_bin > last_bin {
+        return false;
+    }
+    for bin in first_bin..=last_bin {
+        let omega = std::f64::consts::TAU * bin as f64 / frames as f64;
+        let coeff = 2.0 * omega.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &sample in samples {
+            let s0 = f64::from(sample) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+        dominant = dominant.max(power / (frames as f64 * sum_sq.max(1.0e-12)));
+    }
+    dominant > 0.22
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -291,6 +399,8 @@ impl AudioState {
             pending_channels: nch,
             pending_len: 0,
             read: 0.0,
+            speaker_guard: SpeakerGuard { gain: 1.0 },
+            feedback_guard: FeedbackGuard { hot_blocks: 0, gain: 1.0, previous_rms: 0.0 },
             device_rate,
             input: None,
             recording: false,
@@ -492,10 +602,20 @@ impl AudioState {
             let ch = ring.channels.load(Ordering::Relaxed).max(1).min(self.mix.input.len());
             self.mix.input_channels = ch;
             ring.pop_into(&mut self.mix.input[..ch], n, self.session.sample_rate.hz());
+            let active = self.shared.feedback_protection.load(Ordering::Relaxed) && self.session.tracks.iter().any(|t| t.mixer.input_monitor);
+            self.feedback_guard.update(&self.mix.input[..ch], n, self.session.sample_rate.hz(), active);
         } else {
             self.mix.input_channels = 0;
+            self.feedback_guard.update(&[], 0, 1, false);
         }
-        self.mix.monitor_gain = f32::from_bits(self.shared.monitor_gain.load(Ordering::Relaxed));
+        let monitor_gain = f32::from_bits(self.shared.monitor_gain.load(Ordering::Relaxed));
+        self.mix.monitor_gain = if !self.shared.direct_monitor_enabled.load(Ordering::Relaxed) {
+            0.0
+        } else if self.shared.feedback_protection.load(Ordering::Relaxed) {
+            monitor_gain * self.feedback_guard.gain
+        } else {
+            monitor_gain
+        };
         self.mix.monitor_use_rack = self.shared.monitor_use_rack.load(Ordering::Relaxed);
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
@@ -568,17 +688,18 @@ impl AudioState {
                 }
                 for (c, o) in frame.iter_mut().enumerate() {
                     *o = match c {
-                        0 => l.clamp(-1.0, 1.0),
-                        1 => r.clamp(-1.0, 1.0),
+                        0 => l,
+                        1 => r,
                         _ => 0.0,
                     };
                 }
             } else {
                 for (c, o) in frame.iter_mut().enumerate() {
                     // Stereo mixes on a mono device play the left channel (as before).
-                    *o = if c < nch.max(1) && sounding { sample(c).clamp(-1.0, 1.0) } else { 0.0 };
+                    *o = if c < nch.max(1) && sounding { sample(c) } else { 0.0 };
                 }
             }
+            self.speaker_guard.process(frame, self.device_rate, self.shared.speaker_protection.load(Ordering::Relaxed));
             self.read += step;
         }
     }
@@ -706,6 +827,9 @@ impl Player {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -950,6 +1074,21 @@ impl Player {
     /// Include the track's inserts in live input monitoring (false is a dry listen).
     pub fn set_monitor_use_rack(&self, enabled: bool) {
         self.shared.monitor_use_rack.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable or disable input monitoring while retaining its configured level.
+    pub fn set_direct_monitor_enabled(&self, enabled: bool) {
+        self.shared.direct_monitor_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable gradual monitor-send suppression for sustained resonant input.
+    pub fn set_feedback_protection(&self, enabled: bool) {
+        self.shared.feedback_protection.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable the output safety limiter at −1 dBFS.
+    pub fn set_speaker_protection(&self, enabled: bool) {
+        self.shared.speaker_protection.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_recording(&self, on: bool) {
@@ -1266,6 +1405,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let mut source = HashMap::new();
@@ -1288,6 +1430,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         };
 
@@ -1313,6 +1458,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let fault = Fault::default();
@@ -1357,6 +1505,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1378,6 +1529,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1402,6 +1556,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         };
         let guard = shared.meters.lock().unwrap();
@@ -1427,6 +1584,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1454,6 +1614,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1491,6 +1654,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1523,6 +1689,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1557,6 +1726,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (_tx, rx) = test_channel();
@@ -1578,6 +1750,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1606,6 +1781,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1652,6 +1830,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1750,6 +1931,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1782,6 +1966,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1820,6 +2007,9 @@ mod tests {
                 output_clip_events: AtomicU32::new(0),
                 monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
                 monitor_use_rack: AtomicBool::new(true),
+                direct_monitor_enabled: AtomicBool::new(true),
+                feedback_protection: AtomicBool::new(false),
+                speaker_protection: AtomicBool::new(false),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             let (tx, rx) = test_channel();
@@ -1853,6 +2043,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &s);
@@ -1897,6 +2090,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -1962,6 +2158,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
@@ -2002,6 +2201,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -2067,6 +2269,9 @@ mod tests {
             output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
+            direct_monitor_enabled: AtomicBool::new(true),
+            feedback_protection: AtomicBool::new(false),
+            speaker_protection: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -2165,6 +2370,9 @@ mod tests {
                 output_clip_events: AtomicU32::new(0),
                 monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
                 monitor_use_rack: AtomicBool::new(true),
+                direct_monitor_enabled: AtomicBool::new(true),
+                feedback_protection: AtomicBool::new(false),
+                speaker_protection: AtomicBool::new(false),
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             prepare_meter_layout(&shared, &session);
@@ -2212,5 +2420,44 @@ mod tests {
                 timings[CALLBACKS - 1]
             );
         }
+    }
+
+    #[test]
+    fn feedback_guard_ducks_sustained_resonance_and_ignores_broadband_input() {
+        let frames = 512;
+        let mut guard = FeedbackGuard { hot_blocks: 0, gain: 1.0, previous_rms: 0.0 };
+        for block in 0..12 {
+            let amplitude = 0.32 * 1.06_f32.powi(block);
+            let tone: Vec<f32> = (0..frames).map(|i| (std::f32::consts::TAU * 10.0 * i as f32 / frames as f32).sin() * amplitude).collect();
+            assert!(resonant_input(&tone, frames, 48_000));
+            guard.update(std::slice::from_ref(&tone), frames, 48_000, true);
+        }
+        assert!(guard.gain < 1.0);
+        guard.update(&[], 0, 48_000, false);
+        assert!(guard.gain > 0.0);
+
+        let mut state = 0x1234_5678u32;
+        let noise: Vec<f32> = (0..frames)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state as i32 as f32 / i32::MAX as f32) * 0.5
+            })
+            .collect();
+        assert!(!resonant_input(&noise, frames, 48_000));
+        assert!(!resonant_input(&vec![0.01; frames], frames, 48_000));
+    }
+
+    #[test]
+    fn speaker_guard_caps_peaks_and_recovers_smoothly() {
+        let mut guard = SpeakerGuard { gain: 1.0 };
+        let mut loud = [1.5, -1.25];
+        guard.process(&mut loud, 48_000.0, true);
+        assert!(loud.iter().all(|sample| sample.abs() <= SpeakerGuard::CEILING));
+        let reduced = guard.gain;
+        let mut silence = [0.0; 2];
+        guard.process(&mut silence, 48_000.0, true);
+        assert!(guard.gain > reduced && guard.gain < 1.0);
     }
 }
