@@ -1,6 +1,6 @@
 # SoundCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-18 · **Change:** minor (downstream mobile input-meter envelope, idle-monitor bypass and output safety controls; parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 The mobile fork publishes per-input peak envelopes from the capture callback
 through preallocated atomics. Meter reads avoid the waveform overview mutex and
@@ -123,6 +123,9 @@ Status: ✅ done · 🟡 in progress · ⬜ not started.
 | M16 | Built-in plugin depth, sidechain, ARA | ⬜ | 110–170 |
 | M17 | Immersive delivery (ADM BWF, object renderer, binaural) and video depth | ⬜ | 80–130 |
 
+M8 follow-up (2026-10-14): MCP batches above 1000 calls are rejected before execution (#460).
+The limit is advertised in the tool schema and description; stage and readiness estimates are unchanged.
+
 ## To beta (~350–570 h, about 60–70 % parallelizable)
 
 Beta needs ~75 % ready for real work and no blocking gap in session interchange.
@@ -155,6 +158,8 @@ There is no `cargo xtask scorecard` in this repo; the measured number is `cargo 
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | Downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches kept, parity unchanged |
+| 2026-10-14 | trivial | M8: reject oversized MCP batches before execution (#460) |
 | 2026-10-15 | minor | Add target five-track vocal callback allocation/PCM coverage |
 | 2026-10-15 | minor | Add measured callback allocation regressions and dynamic-delay capacity bounds |
 | 2026-10-15 | minor | Connect mobile handoff with bounded ordered rings and overload diagnostics |
