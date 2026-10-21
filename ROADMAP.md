@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -122,25 +122,12 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
-- **2026-10-21 (downstream LiteDAW merge; not an upstream release):** Merged SoundCraft v0.10.0 into the mobile fork. The mobile patches (bounded playback handoff, prepared mixers, input-meter envelopes, monitor safety) are kept; upstream's playback changes were combined with them. No parity or readiness estimate changes.
 - **2026-10-18:** Mono audio devices receive the average of the stereo channels before output clipping, retaining right-only audio. Surround mixes use the same average after their ITU stereo fold-down. Regression tests cover channel balance, polarity cancellation, clipping, centered mono tracks, each 5.1 channel and several callback sizes. No readiness percentage change.
 - **2026-10-16:** Master fader volume automation uses each render block's actual last sample, matching track faders. Breakpoints in the next block no longer pull the preceding block's level toward them, and ramps reach their last-sample value. Regression tests cover nonzero starts, one-sample callbacks and several block sizes. No readiness percentage change.
 - **2026-10-16:** Aux, folder and master latency calculations exclude inserts already taken out for producing NaN or infinity, matching audio tracks. Subsequent blocks no longer compensate for an insert that is bypassed after failure. Regression tests check impulse timing, healthy insert latency and reset/retry at 64- and 512-sample blocks. No readiness percentage change.
 - **2026-10-14:** MCP `batch` rejects more than 1000 calls before executing any command, instead of silently running only the first 1000 (#460). No readiness percentage change.
 - **2026-10-13:** WAV: an empty data chunk followed by metadata (LIST, bext) reads as no audio; a recording that was never finalised (sizes left at 0) still gives what was written (#466)
 - **2026-10-13:** Sampler: a ping-pong loop keeps its phase and direction when a step is wider than the loop (a narrow loop with high transposition), instead of reflecting once and dropping the rest of the travel (#463)
-- **2026-10-15 (target mobile vocal workload):** A guarded AudioState regression renders one stereo backing plus four mono vocal strips, each with EQ, compressor, de-esser, and reverb, through a stereo master at 48 kHz. Both 128/256-frame configurations run 1,024 callbacks with zero Rust allocations/frees and exact PCM agreement with the persistent mix reference. Every audio strip must produce a nonzero meter. Instrumented host timings are printed for reproducibility; they do not establish phone deadlines, driver behavior, drift, or 30-minute stability.
-
-- **2026-10-15 (measured callback allocation regressions):** A test-only Rust allocation counter now measures guarded mobile callback bodies. Track additions/removal, reverb edits, larger compensation-capacity handoff, and combined lookahead automation retain sample equality with a persistent mixer while recording zero Rust heap allocations/frees. The baseline lookahead transition allocated twice; prepared maximum-latency bounds and retained delay capacity remove that path. Compressor declares its prepared bound; all built-in parameter extrema/defaults are swept at 44.1/48/96 kHz. Handoffs copy live history into larger prepared rings where needed. Bus scratch ownership clones the existing hasher rather than creating a callback-thread RandomState. These host scenarios do not establish native driver allocation behavior or physical deadlines; clip-effect preparation and other unmeasured paths remain open.
-
-- **2026-10-15 (bounded mobile playback handoff):** Built-in-only playback prepares replacement mixers and static compensation storage on the control thread, transfers compatible live DSP state, and returns whole old mixers/snapshots through a fixed-capacity SPSC retirement ring. The command ring holds eight entries and the retirement ring four; callback draining remains bounded and ordered. Overload silences output and reports a fault for control-thread recovery. Replaced input rings use the same retirement path; backpressure retains ownership without overwriting it. Host regressions exercise actual AudioState handoffs, PCM/tail continuity, overload, producer-lock independence, and saturated retirement. Dynamic latency/clip-effect preparation and physical callback measurements remain open. Hosted playback retains its existing preparation path.
-
-- **2026-10-15 (prepared mixer state handoff):** The built-in-only mixer now exposes control-thread delay preparation and an ownership-only runtime-state transfer between independently prepared layouts. Reverb tails, unchanged delay histories, parameter smoothing, and compatible instrument state can survive replacement; spare/removed objects remain owned by the old mixer for control-thread retirement. Five host regressions verify exact PCM across edits, initial-path parity, parameter identity changes, rate incompatibility, and deferred plugin destruction. Playback integration with bounded ordered delivery is still pending; dynamic latency automation and clip-effect state transfer remain open. No realtime or device gate is closed.
-
-- **2026-10-15 (render workspace preparation):** Synchronization now prepares main-meter channels, send/output buffers, zero-delay channel storage, and parameter caches before the first render. Empty plugin adoption preserves that prepared layout. Parameter-name changes invalidate caches even when the parameter count and numeric values match; value-only edits preserve caches and plugin state. Host mobile-feature tests verify buffer retention, parameter application, and first-block sample parity. Structural session updates and nonzero latency changes still need callback-safe preparation; no realtime or device gate is closed.
-
-- **2026-10-15 (capture-loss diagnostics):** `Recorder::lost_samples` exposes exact interleaved sample loss for hosts that stop damaged takes promptly. Finalization now warns even when loss is smaller than a millisecond or one input frame. A terminated writer is reported both during capture and at finalization, with its partial file left for recovery. Simulated full-ring and worker-failure regressions preserve the valid WAV prefix. No physical-device or parity/readiness claim.
-- **2026-10-15 (downstream LiteDAW feasibility patch; not an upstream release):** Desktop plugin hosts and video are feature-gated, mobile mix builds select serial rendering, and playback callback work is bounded for command draining and object retirement. Regression coverage also fixes playlist ordering after fade deletion and avoids callback allocations for input scratch buffers, prepared meter snapshots, and output buffers when the session changes channel layout. The initial playback session now synchronizes routing, strips, per-track meter storage, scratch buffers, work-list capacity, and auxiliary-route capacity on the stream-construction thread before callbacks begin. Structural updates after startup still synchronize on the callback and remain an open realtime gate. Full `cargo +1.95.0 xtask ci` passes with `CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1`. The local patch does not change SoundCraft parity/readiness estimates and needs a reachable mobile fork before another repository can pin it.
 - **2026-10-13:** `mix.instrument` takes the built-in instrument's parameters in `params` (validated, clamped) and refuses any other field, so a synth setting written beside `plugin` is an error instead of being accepted and ignored (#265)
 - **2026-10-13:** A bounce of a bus that an aux returns onto lines up with the timeline: the aux insert's lookahead is compensated like the main mix's (it left the bus late and cut the end off), and tracks routed to that bus wait for it too (#246)
 - **2026-10-13:** Delay compensation covers the inserts of the master faders: a bounce of the main mix with a Maximizer on the master lines up with the same mix without it (it came out 71 samples late) (#351)
@@ -174,24 +161,12 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-21 | minor | Downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches kept, parity unchanged |
 | 2026-10-18 | trivial | Mono device playback retains both stereo sides and surround fold-down channels; readiness estimates unchanged |
 | 2026-10-16 | trivial | Master volume automation block boundaries corrected; readiness estimates unchanged |
 | 2026-10-16 | trivial | Failed inserts no longer contribute aux, folder or master latency after containment; readiness estimates unchanged |
 | 2026-10-14 | trivial | Progress log: oversized MCP batches rejected before execution (#460) |
 | 2026-10-13 | trivial | Progress log: empty WAV data chunk followed by metadata (#466) |
 | 2026-10-13 | trivial | Progress log: sampler ping-pong phase for wide steps (#463) |
-| 2026-10-15 | minor | Per-track sample-peak overload history for mobile Studio LEDs; readiness unchanged |
-| 2026-10-15 | minor | Callback master overload telemetry for mobile LED meters; no physical readiness change |
-| 2026-10-15 | minor | Measure the five-track vocal workload at 128/256-frame callbacks |
-| 2026-10-15 | minor | Instrument guarded mobile callbacks and reserve dynamic delay capacity |
-| 2026-10-15 | minor | Connect bounded mobile session handoff and retire whole mixer/input ownership |
-| 2026-10-15 | minor | Add built-in prepared-mixer state handoff with tail and retirement regressions |
-| 2026-10-15 | minor | Prepare render caches and channel storage before the first block; track parameter identities |
-| 2026-10-15 | trivial | Expose exact capture loss and retain a warning for sub-millisecond/sub-frame overflow |
-| 2026-10-15 | minor | Local downstream mobile-feasibility patch; no parity estimates changed |
-| 2026-10-15 | trivial | Preallocate playback output channels before callbacks; verify session layout changes preserve workspace |
-| 2026-10-15 | trivial | Pre-sync initial playback session and reserve render workspaces before callbacks |
 | 2026-10-13 | trivial | Progress log: mix.instrument params, unknown fields refused (#265) |
 | 2026-10-13 | trivial | Progress log: bus bounce compensates aux returns (#246) |
 | 2026-10-13 | trivial | Progress log: master insert latency compensated (#351) |
@@ -204,26 +179,3 @@ mutated and truncated movies. Field reports from the first public week are track
 | 2026-10-10 | major | Rewritten to the progress-docs standard: stage alpha (re-normalized the same day), two numbers (breadth ~70 %, ready ~40 %), dimension/feature/language tables, hours re-calibrated; area table moved to docs/target-app-parity.md, milestones to docs/roadmap.md |
 | 2026-10-07 | major | Menu parity 94 %, ~65 % estimated feature parity, alpha list |
 | 2026-10-06 | minor | Alpha and parity estimates |
-
-## Downstream stereo balance (2026-10-17)
-
-Optional serialized strip balance attenuates stereo output columns after inserts
-and panning on the shared realtime/offline path. Default zero preserves existing
-sessions and dual-panner behavior; LiteDAW uses hard L/R panners plus balance.
-No callback allocation or parity metric changes.
-
-## Downstream waveform RMS ranges (2026-10-17)
-
-Added a bounded, cached RMS range query for integer sample intervals. LiteDAW
-uses exact rational raster boundaries to avoid float-step inclusion of a sample
-from the preceding bin. Existing floating-span callers retain their semantics.
-Parity metrics unchanged.
-
-## Downstream 0.8.0 integration (2026-10-18)
-
-Merged upstream v0.8.0 while preserving all mobile callback preparation, bounded
-queues/capture reporting, DSP-state handoffs, monitoring/metering and feature gates.
-The import-video merge retains the mobile video feature gate and initializes the
-new offline-reason field. Stored-path/ProRes fixes are retained for enabled paths.
-Workspace MSRV is 1.95 to match mandatory craft-docpath. No parity metrics or
-product-readiness gates changed. Validation is recorded in LiteDAW plan.md.

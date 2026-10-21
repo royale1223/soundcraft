@@ -1,6 +1,6 @@
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches and parity unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (G-04: mono device playback fold-down) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -41,14 +41,6 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 ## Details
 
 ### G-01. Audio interface support
-
-Downstream mobile evidence (2026-10-15): a five-track vocal workload with four
-built-in processors per vocal measures zero Rust allocations/frees in guarded
-AudioState callbacks at 48 kHz and 128/256 frames, with exact reference PCM.
-This narrows the tested host-workload gap only. It does not validate a device
-backend, full-duplex timing, drift, recording loss, or sustained phone deadlines;
-the hardware gate remains open. Reproduce with
-`cargo test -p soundcraft-playback --no-default-features mobile_five_track_vocal_workload -- --nocapture`.
 
 - **Done (2026-10-12):** Setup › Playback Engine chooses the audio system, output and input
   device, sample rate and device buffer size (kept with the preferences, per machine; `ui.audio_device`
@@ -222,11 +214,9 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-21 | minor | Downstream LiteDAW merge of SoundCraft v0.10.0; mobile patches kept, parity unchanged |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |
-| 2026-10-15 | minor | Record downstream vocal-workload evidence without closing physical G-01 |
 | 2026-10-12 | minor | G-01 shrunk: audio device, rate and buffer choice; opt-in ASIO |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
 | 2026-10-10 | major | Created from the full re-measure against Pro Tools Ultimate 2026.4.1: 22 ranked gaps with evidence and estimates |
