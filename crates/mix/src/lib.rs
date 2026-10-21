@@ -1642,7 +1642,9 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             continue;
         }
         let ClipContent::Midi { sequence } = &clip.content else { continue };
-        if !clip.range().overlaps(&Range { start: pos, end }) {
+        // A note-off clamped to the clip end falls on the first sample after the
+        // clip, so a block starting exactly there still releases its notes.
+        if !clip.range().overlaps(&Range { start: pos, end }) && clip.end() != pos {
             continue;
         }
         let base = s.tempo.samples_to_ticks(clip.start, sr);
@@ -2493,6 +2495,20 @@ mod tests {
         let (loud, quiet) = (rms(-6.0), rms(-12.0));
         assert!(loud > 0.0, "the synth should sound");
         assert!((quiet / loud - 0.5).abs() < 0.05, "-12 dB vs -6 dB should halve the level: {quiet} / {loud}");
+    }
+
+    #[test]
+    fn note_off_at_the_clip_end_on_a_block_boundary_releases_the_note() {
+        // The note ends with its 24,000-sample clip; 480-frame blocks put that
+        // note-off at the first sample of the block after the clip.
+        let mut s = synth_session(-6.0);
+        if let Some(ins) = s.tracks[0].instrument.as_mut() {
+            ins.params.insert("amp_release".into(), 20.0);
+        }
+        let out = render_range(&s, Range::new(0, 48_000), 480);
+        let peak = |r: std::ops::Range<usize>| out[0].get(r).unwrap_or_default().iter().fold(0.0_f32, |p, x| p.max(x.abs()));
+        assert!(peak(12_000..24_000) > 0.01, "the synth should sound");
+        assert!(peak(30_000..48_000) < 1e-4, "the note must be released at the clip end");
     }
 
     #[test]
