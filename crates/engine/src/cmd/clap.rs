@@ -1,11 +1,13 @@
 //! Third-party CLAP plugins: discovery (`engine.clap_plugins`) and id lookup shared by the mixer
 //! commands. Hosting itself lives in `soundcraft-clap-host`.
+use super::CommandSpec;
+#[cfg(feature = "plugin-hosts")]
+use super::always;
 
-use super::*;
 #[cfg(feature = "plugin-hosts")]
 use crate::cmd;
 #[cfg(feature = "plugin-hosts")]
-use serde_json::json;
+use serde_json::{Value, json};
 use soundcraft_dsp::PluginInfo;
 
 pub fn specs() -> Vec<CommandSpec> {

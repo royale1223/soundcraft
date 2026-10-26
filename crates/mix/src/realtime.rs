@@ -91,22 +91,26 @@ impl MixEngine {
             for (delay, old) in
                 [(&mut strip.align, &mut old.align), (&mut strip.align_pre, &mut old.align_pre), (&mut strip.out_extra, &mut old.out_extra)]
             {
-                if delay.bufs.len() != old.bufs.len() || delay.bufs.iter().any(|buffer| buffer.capacity() < old.len) {
+                if delay.bufs.len() != old.bufs.len() {
                     continue;
                 }
-                if old.bufs.iter().zip(&delay.bufs).all(|(old, next)| old.capacity() >= next.capacity()) {
+                let old_cap = old.bufs.first().map_or(0, Vec::len);
+                let next_cap = delay.bufs.first().map_or(0, Vec::len);
+                if old_cap >= next_cap {
                     std::mem::swap(delay, old);
                 } else {
-                    // Keep the larger prepared capacity; swapping in smaller old rings would
-                    // reintroduce a callback allocation when later automation needs it.
-                    delay.len = old.len;
-                    delay.idx = old.idx;
+                    // Keep the larger prepared rings; swapping in smaller old rings would
+                    // reintroduce a callback allocation when later automation needs it. Copy the
+                    // live history oldest first, as DelayLine growth does, so reads continue.
+                    let start = old.idx.min(old_cap);
                     for (next, old) in delay.bufs.iter_mut().zip(&old.bufs) {
-                        next.resize(delay.len, 0.0);
-                        if let Some(history) = old.get(..delay.len) {
-                            next.copy_from_slice(history);
-                        }
+                        let (head, tail) = old.split_at(start);
+                        next[..tail.len()].copy_from_slice(tail);
+                        next[tail.len()..old_cap].copy_from_slice(head);
+                        next[old_cap..].fill(0.0);
                     }
+                    delay.len = old.len;
+                    delay.idx = old_cap;
                 }
             }
         }
