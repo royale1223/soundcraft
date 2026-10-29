@@ -234,6 +234,8 @@ struct Shared {
     direct_monitor_enabled: AtomicBool,
     feedback_protection: AtomicBool,
     speaker_protection: AtomicBool,
+    /// A stop was requested and its fade-out has not finished playing yet.
+    stop_fading: AtomicBool,
     meters: Mutex<MeterSnapshot>,
 }
 
@@ -325,6 +327,7 @@ impl Player {
             direct_monitor_enabled: AtomicBool::new(true),
             feedback_protection: AtomicBool::new(false),
             speaker_protection: AtomicBool::new(false),
+            stop_fading: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -611,9 +614,25 @@ impl Player {
         let _ = self.tx.send(Cmd::Recording(on));
     }
 
+    /// Stop playback. The output fades out over a few milliseconds first (see
+    /// [`Player::wait_stopped`] before dropping the player, or the stream is cut mid-fade).
     pub fn stop(&self) {
         self.shared.playing.store(false, Ordering::Relaxed);
+        self.shared.stop_fading.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Stop);
+    }
+
+    /// Wait (on the control thread) until a requested stop has faded out, for at most `timeout`.
+    /// False on timeout, e.g. when the device is not calling back.
+    pub fn wait_stopped(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.shared.stop_fading.load(Ordering::Relaxed) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
     }
 
     pub fn locate(&self, at: Samples) {

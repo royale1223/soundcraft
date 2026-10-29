@@ -158,6 +158,7 @@ fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, super::Sender<Cmd
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     // As Player does before the device starts: the control thread shapes the shared meters.
@@ -210,6 +211,8 @@ fn stopping_zeroes_meters_in_place_and_removed_tracks_are_pruned() {
     let mut out = vec![0.0f32; 2 * 512];
     st.fill(&mut out, 2);
     tx.send(Cmd::Stop).unwrap();
+    // The first callback after the stop plays its fade-out; the next is silent.
+    st.fill(&mut out, 2);
     st.fill(&mut out, 2);
     {
         let m = shared.meters.lock().unwrap();
@@ -272,6 +275,7 @@ fn callback_meter_publication_skips_unprepared_tracks_without_inserting() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     };
     let mut source = HashMap::new();
@@ -300,6 +304,7 @@ fn meter_layout_is_resized_and_pruned_on_the_control_thread() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     };
 
@@ -328,6 +333,7 @@ fn a_block_that_panics_goes_silent_and_is_reported_once() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     };
     let fault = Fault::default();
@@ -375,6 +381,7 @@ fn audio_state_plays_and_stops_at_end() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -399,6 +406,7 @@ fn command_drain_is_bounded_and_keeps_commands_in_order() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -426,6 +434,7 @@ fn output_overload_survives_meter_contention_and_later_quiet_blocks() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (_tx, rx) = test_channel();
@@ -457,6 +466,7 @@ fn one_session_update_is_applied_per_callback_drain() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -487,6 +497,7 @@ fn a_full_session_return_queue_never_drops_the_replaced_session_in_the_callback(
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -532,6 +543,7 @@ fn a_full_plugin_return_queue_retains_instances_and_stops_rendering_until_collec
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (_tx, rx) = test_channel();
@@ -567,6 +579,7 @@ fn live_input_channel_changes_reuse_preallocated_mixer_buffers() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -604,6 +617,7 @@ fn initial_session_is_synchronized_before_the_callback_starts() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (_tx, rx) = test_channel();
@@ -628,6 +642,7 @@ fn short_device_callbacks_render_short_mix_blocks() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -658,10 +673,13 @@ fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
-    let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    let mut st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    // These tests compare exact output from the first sample.
+    st.fades = false;
     tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     st
 }
@@ -771,11 +789,13 @@ fn surround_main_maps_to_device_channels_or_folds_down() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
     let initial = Arc::new(soundcraft_model::Session::default());
     let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&initial), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    st.fades = false;
     let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
     tx.send(Cmd::OldSessions(old_tx)).unwrap();
     tx.send(test_session(Arc::clone(&s), Vec::new())).unwrap();
@@ -820,6 +840,7 @@ fn instances_arrive_with_the_session_and_leave_through_the_return_channel() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -970,6 +991,7 @@ fn replaced_sessions_are_freed_on_the_ui_thread() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -1005,6 +1027,7 @@ fn looping_wraps() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -1046,6 +1069,7 @@ fn locate_while_playing_drops_the_old_position_audio() {
             direct_monitor_enabled: AtomicBool::new(true),
             feedback_protection: AtomicBool::new(false),
             speaker_protection: AtomicBool::new(false),
+            stop_fading: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = test_channel();
@@ -1082,6 +1106,7 @@ fn armed_tracks_are_heard_and_metered_after_playback_stops() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     prepare_meter_layout(&shared, &s);
@@ -1127,6 +1152,7 @@ fn mobile_session_handoff_uses_the_prepared_box_and_preserves_the_live_tail() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     prepare_meter_layout(&shared, &session);
@@ -1136,6 +1162,7 @@ fn mobile_session_handoff_uses_the_prepared_box_and_preserves_the_live_tail() {
     tx.send(Cmd::OldSessions(old_tx)).unwrap();
     tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    state.fades = false;
     let mut reference = MixEngine::new(48_000.0, BLOCK);
     let mut expected = vec![vec![0.0; 128]; 2];
     let mut output = vec![0.0; 256];
@@ -1195,6 +1222,7 @@ fn mobile_command_overload_stops_output_and_reports_once() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = channel();
@@ -1238,6 +1266,7 @@ fn replaced_input_rings_are_retired_without_overwriting_pending_ownership() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     let (tx, rx) = test_channel();
@@ -1304,6 +1333,7 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
         direct_monitor_enabled: AtomicBool::new(true),
         feedback_protection: AtomicBool::new(false),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     prepare_meter_layout(&shared, &session);
@@ -1311,6 +1341,7 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
     let (old_tx, mut old_rx) = return_channel(OLD_SESSIONS);
     tx.send(Cmd::OldSessions(old_tx)).unwrap();
     let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    state.fades = false;
     tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     let fault = Fault::default();
     let mut output = vec![0.0; 256];
@@ -1405,6 +1436,7 @@ fn mobile_five_track_vocal_workload_has_no_callback_allocations_or_frees() {
             direct_monitor_enabled: AtomicBool::new(true),
             feedback_protection: AtomicBool::new(false),
             speaker_protection: AtomicBool::new(false),
+            stop_fading: AtomicBool::new(false),
             meters: Mutex::new(MeterSnapshot::default()),
         });
         prepare_meter_layout(&shared, &session);
@@ -1487,11 +1519,13 @@ fn three_playing_tracks_with_dm_off_skip_monitor_rack_and_feedback_without_alloc
         direct_monitor_enabled: AtomicBool::new(false),
         feedback_protection: AtomicBool::new(true),
         speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
         meters: Mutex::new(MeterSnapshot::default()),
     });
     prepare_meter_layout(&shared, &session);
     let (_tx, rx) = channel();
     let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::new(session.clone()), 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    state.fades = false;
     state.playing = true;
     state.recording = true;
     let input = record::InputRing::new(1, 48_000);
@@ -1570,4 +1604,34 @@ fn speaker_guard_caps_peaks_and_recovers_smoothly() {
     let mut silence = [0.0; 2];
     guard.process(&mut silence, 48_000.0, true);
     assert!(guard.gain > reduced && guard.gain < 1.0);
+}
+
+#[test]
+fn playback_fades_in_on_play_and_out_on_stop() {
+    use soundcraft_model::ChannelFormat;
+    let mut st = audio_output_state(ChannelFormat::Stereo, vec![vec![0.8; 48_000]; 2]);
+    st.fades = true;
+    let fade = (48_000.0 * 0.01) as usize;
+    let mut out = vec![0.0f32; 2 * 1024];
+    st.fill(&mut out, 2);
+    let steady = out[2 * 1000];
+    assert!(steady > 0.5);
+    assert!(out[0] < steady * 0.01, "playback starts from silence: {}", out[0]);
+    assert!(out.chunks(2).take(fade).collect::<Vec<_>>().windows(2).all(|w| w[1][0] >= w[0][0]), "the start ramps up");
+    assert!(out.chunks(2).skip(fade + 1).all(|f| (f[0] - steady).abs() < 1e-6), "full level after the fade");
+
+    let stopped_at = st.pos;
+    st.shared.stop_fading.store(true, Ordering::Relaxed);
+    st.shared.playing.store(false, Ordering::Relaxed);
+    let (tx, rx) = test_channel();
+    st.rx = rx;
+    tx.send(Cmd::Stop).unwrap();
+    st.fill(&mut out, 2);
+    assert!(out[0] > steady * 0.9, "the stop fades rather than cutting");
+    assert!(out.chunks(2).take(fade).collect::<Vec<_>>().windows(2).all(|w| w[1][0] <= w[0][0]), "the stop ramps down");
+    assert!(out.chunks(2).skip(fade + 1).all(|f| f[0] == 0.0 && f[1] == 0.0), "silent once faded");
+    assert!(!st.playing && st.stopping.is_none());
+    assert!(!st.shared.stop_fading.load(Ordering::Relaxed), "the player can be dropped now");
+    assert!(!st.shared.playing.load(Ordering::Relaxed), "the transport read stopped throughout");
+    assert_eq!(st.pos, stopped_at, "the fade's extra frames do not move the stop position");
 }

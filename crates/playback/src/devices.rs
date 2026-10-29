@@ -117,10 +117,18 @@ pub fn audio_systems() -> Vec<AudioSystem> {
 /// (`DeviceChanged`) keeps playing, and an xrun is transient, so neither is a lost stream.
 /// `HostUnavailable`, `DeviceBusy` and `BackendError` stay log-only until their retry/rebuild
 /// policies exist.
+///
+/// Mobile fork: on iOS and Android only `DeviceNotAvailable` counts. cpal's iOS backend reports
+/// `StreamInvalidated` for audio-session route changes (category change, override, route
+/// configuration change) that the app itself causes, for example by opening the microphone, while
+/// the stream keeps running; treating them as lost stopped playback and would end a take.
 pub(crate) fn stream_lost(e: &cpal::Error) -> bool {
+    kind_lost(e.kind(), cfg!(any(target_os = "ios", target_os = "android")))
+}
+
+fn kind_lost(kind: cpal::ErrorKind, mobile: bool) -> bool {
     // ErrorKind is non-exhaustive; an equality test avoids a wildcard match arm.
-    let kind = e.kind();
-    kind == cpal::ErrorKind::DeviceNotAvailable || kind == cpal::ErrorKind::StreamInvalidated
+    kind == cpal::ErrorKind::DeviceNotAvailable || (!mobile && kind == cpal::ErrorKind::StreamInvalidated)
 }
 
 /// The device's configuration at `sample_rate` in the best sample format these streams convert.
@@ -260,6 +268,15 @@ mod tests {
         ] {
             assert!(!stream_lost(&error(kind)), "{kind:?} must not stop the stream");
         }
+    }
+
+    /// iOS raises `StreamInvalidated` for session route changes the app causes; on mobile only a
+    /// missing device stops the stream.
+    #[test]
+    fn mobile_keeps_streams_through_invalidation_notices() {
+        assert!(kind_lost(cpal::ErrorKind::DeviceNotAvailable, true));
+        assert!(!kind_lost(cpal::ErrorKind::StreamInvalidated, true));
+        assert!(kind_lost(cpal::ErrorKind::StreamInvalidated, false));
     }
 
     #[test]

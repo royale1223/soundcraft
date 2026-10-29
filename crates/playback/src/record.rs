@@ -181,7 +181,8 @@ where
             // Possibly the audio thread (see `crate::mark_audio_thread`).
             crate::mark_audio_thread();
             // cpal 0.18 reports every operation through one error type; a device that went away
-            // or a stream that must be rebuilt (`StreamInvalidated`) stops capture.
+            // or a stream that must be rebuilt (`StreamInvalidated`, not on mobile: see
+            // `stream_lost`) stops capture.
             // `DeviceChanged` (a rerouted default device) and an xrun are not faults.
             if crate::devices::stream_lost(&e) {
                 let _ = errors.fault.compare_exchange(0, GONE, Ordering::Relaxed, Ordering::Relaxed);

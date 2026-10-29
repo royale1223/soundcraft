@@ -26,14 +26,6 @@ impl StripMeter {
         self.plugin_failures = o.plugin_failures;
     }
 
-    /// Reset instantaneous values, retaining overload history and channel storage.
-    pub fn clear(&mut self) {
-        self.peak = [0.0; 2];
-        self.peaks.fill(0.0);
-        self.gain_reduction_db = 0.0;
-        self.plugin_failures = PluginFailures::default();
-    }
-
     /// Fold another (later) measurement in: per-channel peaks and the gain reduction keep their
     /// maximum, plugin failures take the later value (the count only grows). Allocation-free once
     /// the channel count is stable, so it can run on the audio thread every block.
@@ -57,7 +49,7 @@ impl StripMeter {
     }
 
     /// Zero the levels (peaks and gain reduction) after a reader took them, keeping the channel
-    /// count and the plugin failure record. Never allocates.
+    /// count, the plugin failure record and the overload count (`clip_events`). Never allocates.
     pub fn reset_levels(&mut self) {
         self.peak = [0.0; 2];
         self.peaks.iter_mut().for_each(|p| *p = 0.0);

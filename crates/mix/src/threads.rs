@@ -59,7 +59,7 @@ mod audio_thread_tests {
         assert_eq!(meter.clip_events, 1);
         meter.measure(&[vec![0.0; 3]], 3, 0.0);
         assert_eq!(meter.clip_events, 1);
-        meter.clear();
+        meter.reset_levels();
         assert_eq!(meter.clip_events, 1);
         assert_eq!(meter.peak, [0.0; 2]);
         let mut published = StripMeter::default();
