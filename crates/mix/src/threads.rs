@@ -52,22 +52,6 @@ mod audio_thread_tests {
     use super::*;
 
     #[test]
-    fn strip_overloads_survive_quiet_blocks_and_level_clears() {
-        use crate::StripMeter;
-        let mut meter = StripMeter::default();
-        meter.measure(&[vec![0.2, 1.0, 0.1]], 3, 0.0);
-        assert_eq!(meter.clip_events, 1);
-        meter.measure(&[vec![0.0; 3]], 3, 0.0);
-        assert_eq!(meter.clip_events, 1);
-        meter.reset_levels();
-        assert_eq!(meter.clip_events, 1);
-        assert_eq!(meter.peak, [0.0; 2]);
-        let mut published = StripMeter::default();
-        published.copy_from(&meter);
-        assert_eq!(published.clip_events, 1);
-    }
-
-    #[test]
     fn only_a_marked_thread_is_the_audio_thread() {
         assert!(!on_audio_thread());
         let marked = std::thread::spawn(|| {

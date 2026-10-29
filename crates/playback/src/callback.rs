@@ -564,12 +564,8 @@ impl AudioState {
     }
 
     /// Hand this block's meters to the UI without blocking: they are folded (max) into what the
-    /// UI has not taken yet. If the UI holds the snapshot right now, they wait in `unsent`. The
-    /// overload count is updated first, so lock contention cannot hide an overload.
+    /// UI has not taken yet. If the UI holds the snapshot right now, they wait in `unsent`.
     pub(crate) fn publish_meters(&mut self) {
-        if self.mix.main_meter.peaks.iter().any(|peak| peak.is_finite() && *peak >= 1.0) {
-            self.shared.output_clip_events.fetch_add(1, Ordering::Relaxed);
-        }
         self.unsent.accumulate(&self.mix.main_meter, &self.mix.meters);
         if let Ok(mut m) = self.shared.meters.try_lock() {
             m.accumulate(&self.unsent.main, &self.unsent.tracks);

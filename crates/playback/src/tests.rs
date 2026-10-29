@@ -152,7 +152,6 @@ fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, super::Sender<Cmd
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -269,7 +268,6 @@ fn callback_meter_publication_skips_unprepared_tracks_without_inserting() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -298,7 +296,6 @@ fn meter_layout_is_resized_and_pruned_on_the_control_thread() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -327,7 +324,6 @@ fn a_block_that_panics_goes_silent_and_is_reported_once() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(true),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -375,7 +371,6 @@ fn audio_state_plays_and_stops_at_end() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -400,7 +395,6 @@ fn command_drain_is_bounded_and_keeps_commands_in_order() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -423,44 +417,12 @@ fn command_drain_is_bounded_and_keeps_commands_in_order() {
 }
 
 #[test]
-fn output_overload_survives_meter_contention_and_later_quiet_blocks() {
-    let shared = Arc::new(Shared {
-        position: AtomicI64::new(0),
-        playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
-        monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
-        monitor_use_rack: AtomicBool::new(true),
-        direct_monitor_enabled: AtomicBool::new(true),
-        feedback_protection: AtomicBool::new(false),
-        speaker_protection: AtomicBool::new(false),
-        stop_fading: AtomicBool::new(false),
-        meters: Mutex::new(MeterSnapshot::default()),
-    });
-    let (_tx, rx) = test_channel();
-    let session = Arc::new(soundcraft_model::Session::default());
-    let mut st = AudioState::new(rx, Arc::clone(&shared), session, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
-    let guard = shared.meters.lock().unwrap();
-    st.mix.main_meter = StripMeter { peaks: vec![0.25, 1.1], ..Default::default() };
-    st.publish_meters();
-    assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 1);
-    st.mix.main_meter.peaks.fill(0.0);
-    st.publish_meters();
-    assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 1);
-    st.mix.main_meter.peaks[0] = 1.0;
-    st.publish_meters();
-    assert_eq!(shared.output_clip_events.load(Ordering::Relaxed), 2);
-    drop(guard);
-}
-
-#[test]
 fn one_session_update_is_applied_per_callback_drain() {
     let initial = Arc::new(soundcraft_model::Session::default());
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -491,7 +453,6 @@ fn a_full_session_return_queue_never_drops_the_replaced_session_in_the_callback(
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -537,7 +498,6 @@ fn a_full_plugin_return_queue_retains_instances_and_stops_rendering_until_collec
         position: AtomicI64::new(0),
         playing: AtomicBool::new(true),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -573,7 +533,6 @@ fn live_input_channel_changes_reuse_preallocated_mixer_buffers() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -611,7 +570,6 @@ fn initial_session_is_synchronized_before_the_callback_starts() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -636,7 +594,6 @@ fn short_device_callbacks_render_short_mix_blocks() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -667,7 +624,6 @@ fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -783,7 +739,6 @@ fn surround_main_maps_to_device_channels_or_folds_down() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -834,7 +789,6 @@ fn instances_arrive_with_the_session_and_leave_through_the_return_channel() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -985,7 +939,6 @@ fn replaced_sessions_are_freed_on_the_ui_thread() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1021,7 +974,6 @@ fn looping_wraps() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1063,7 +1015,6 @@ fn locate_while_playing_drops_the_old_position_audio() {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
-            output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
             direct_monitor_enabled: AtomicBool::new(true),
@@ -1100,7 +1051,6 @@ fn armed_tracks_are_heard_and_metered_after_playback_stops() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1146,7 +1096,6 @@ fn mobile_session_handoff_uses_the_prepared_box_and_preserves_the_live_tail() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1216,7 +1165,6 @@ fn mobile_command_overload_stops_output_and_reports_once() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(true),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1260,7 +1208,6 @@ fn replaced_input_rings_are_retired_without_overwriting_pending_ownership() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1327,7 +1274,6 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(true),
@@ -1430,7 +1376,6 @@ fn mobile_five_track_vocal_workload_has_no_callback_allocations_or_frees() {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
-            output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
             direct_monitor_enabled: AtomicBool::new(true),
@@ -1513,7 +1458,6 @@ fn three_playing_tracks_with_dm_off_skip_monitor_rack_and_feedback_without_alloc
         position: AtomicI64::new(0),
         playing: AtomicBool::new(true),
         speed: AtomicU32::new(1000),
-        output_clip_events: AtomicU32::new(0),
         monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
         monitor_use_rack: AtomicBool::new(true),
         direct_monitor_enabled: AtomicBool::new(false),

@@ -228,7 +228,6 @@ struct Shared {
     playing: AtomicBool,
     /// Speed × 1000.
     speed: AtomicU32,
-    output_clip_events: AtomicU32,
     monitor_gain: AtomicU32,
     monitor_use_rack: AtomicBool,
     direct_monitor_enabled: AtomicBool,
@@ -321,7 +320,6 @@ impl Player {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
-            output_clip_events: AtomicU32::new(0),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             monitor_use_rack: AtomicBool::new(true),
             direct_monitor_enabled: AtomicBool::new(true),
@@ -656,13 +654,6 @@ impl Player {
 
     pub fn is_playing(&self) -> bool {
         self.shared.playing.load(Ordering::Relaxed)
-    }
-
-    /// Counts master blocks reaching digital full scale. Updated before best-effort meter
-    /// publishing, so UI polling or meter-lock contention cannot hide an overload.
-    /// Wraps only after 2^32 overloaded blocks; a new Player starts at zero.
-    pub fn output_clip_events(&self) -> u32 {
-        self.shared.output_clip_events.load(Ordering::Relaxed)
     }
 
     /// A copy of the meters accumulated since the last [`Player::take_meters`], leaving them in
