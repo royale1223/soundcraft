@@ -1,5 +1,6 @@
 //! Preparation and state handoff for the built-in-only mobile mixer.
-use super::*;
+use super::{MAX_LATENCY, MixEngine, PluginSlot, Samples, Session, TrackKind, main_channels};
+use std::sync::Arc;
 
 impl MixEngine {
     /// Prepare a fresh built-in mixer on a control thread, including compensation delays for
@@ -139,7 +140,8 @@ fn transfer_slot(next: &mut Option<PluginSlot>, old: &mut Option<PluginSlot>) ->
 mod tests {
     use super::*;
     use soundcraft_audio_io::AudioBuffer;
-    use soundcraft_model::{Insert, SourceId};
+    use soundcraft_dsp::Plugin;
+    use soundcraft_model::{ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackId};
 
     fn session() -> (Session, TrackId, TrackId) {
         let mut session = Session::default();
