@@ -86,7 +86,7 @@ impl Peaks {
         if count == 0 {
             return 0.0;
         }
-        (self.sum(samples, start, end).squares / count as f32).sqrt()
+        (self.sum(samples, start, end).squares / count as f64).sqrt() as f32
     }
 
     fn sum(&self, samples: &[f32], start: usize, end: usize) -> Block {
