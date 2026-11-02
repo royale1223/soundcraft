@@ -96,6 +96,9 @@ pub(crate) struct AudioState {
     pub(crate) out_gain: f32,
     /// A stop fading out: the position playback stopped at, restored once the fade ends.
     pub(crate) stopping: Option<Samples>,
+    /// A locate during playback fading out at the old position: the position to jump to once
+    /// silent, after which the output fades back in. Jumping mid-waveform clicked.
+    pub(crate) locating: Option<Samples>,
     /// Start/stop fades are on; tests comparing exact PCM from the first sample turn them off.
     pub(crate) fades: bool,
     pub(crate) feedback_guard: FeedbackGuard,
@@ -266,6 +269,7 @@ impl AudioState {
             speaker_guard: SpeakerGuard { gain: 1.0 },
             out_gain: 1.0,
             stopping: None,
+            locating: None,
             fades: true,
             feedback_guard: FeedbackGuard { hot_blocks: 0, gain: 1.0, previous_rms: 0.0 },
             device_rate,
@@ -359,6 +363,7 @@ impl AudioState {
                     // (fading the whole output would dip it).
                     self.out_gain = if self.monitoring() || !self.fades { 1.0 } else { 0.0 };
                     self.stopping = None;
+                    self.locating = None;
                     self.pos = from;
                     self.end = end;
                     self.looped = looped.filter(|r| r.len() > 64);
@@ -371,7 +376,8 @@ impl AudioState {
                     if self.playing && self.fades && !self.monitoring() {
                         // Fade out over the next frames; `fill` finishes the stop.
                         if self.stopping.is_none() {
-                            self.stopping = Some(self.pos);
+                            // A pending locate's target is where the transport already reads.
+                            self.stopping = Some(self.locating.take().unwrap_or(self.pos));
                         }
                     } else {
                         self.finish_stop();
@@ -381,10 +387,13 @@ impl AudioState {
                     if let Some(stop_at) = &mut self.stopping {
                         *stop_at = at;
                     }
-                    self.pos = at;
-                    self.pending_len = 0;
-                    self.read = 0.0;
-                    self.mix.reset();
+                    if self.playing && self.stopping.is_none() && self.fades && !self.monitoring() {
+                        // Fade out here first; `fill` jumps once silent and fades back in.
+                        self.locating = Some(at);
+                    } else {
+                        self.locating = None;
+                        self.jump_to(at);
+                    }
                 }
             }
             if self.pending_old_session.is_some() {
@@ -472,6 +481,9 @@ impl AudioState {
                 self.playing = false;
                 self.end = None;
                 self.stopping = None;
+                if let Some(at) = self.locating.take() {
+                    self.pos = at;
+                }
                 self.out_gain = 1.0;
                 self.shared.stop_fading.store(false, Ordering::Relaxed);
                 self.shared.playing.store(false, Ordering::Relaxed);
@@ -517,8 +529,8 @@ impl AudioState {
         self.publish_meters();
         if self.playing {
             self.pos += n as i64;
-            // A fading stop keeps rendering, but the transport already reads stopped.
-            if self.stopping.is_none() {
+            // A fading stop or locate keeps rendering, but the transport already reads its target.
+            if self.stopping.is_none() && self.locating.is_none() {
                 self.shared.position.store(self.pos, Ordering::Relaxed);
             }
         }
@@ -534,9 +546,18 @@ impl AudioState {
         self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
     }
 
+    /// Continue from `at`, dropping audio rendered for the old position and effect tails.
+    fn jump_to(&mut self, at: Samples) {
+        self.pos = at;
+        self.pending_len = 0;
+        self.read = 0.0;
+        self.mix.reset();
+    }
+
     /// End playback: what a stop does once its fade-out (if any) has played.
     fn finish_stop(&mut self) {
         self.playing = false;
+        self.locating = None;
         self.end = None;
         self.looped = None;
         self.mix.reset();
@@ -548,14 +569,15 @@ impl AudioState {
     }
 
     /// Ramp the output gain one frame toward its target: down to silence while stopping (finishing
-    /// the stop there), otherwise up to full level. Bounded per-frame work, no allocation.
+    /// the stop there) or locating, otherwise up to full level. Bounded per-frame work, no allocation.
     fn fade_frame(&mut self, frame: &mut [f32]) {
         let stopping = self.stopping.is_some();
-        if !stopping && self.out_gain >= 1.0 {
+        let down = stopping || self.locating.is_some();
+        if !down && self.out_gain >= 1.0 {
             return;
         }
         let step = 1.0 / (self.device_rate * FADE_SECONDS).max(1.0) as f32;
-        self.out_gain = if stopping { (self.out_gain - step).max(0.0) } else { (self.out_gain + step).min(1.0) };
+        self.out_gain = if down { (self.out_gain - step).max(0.0) } else { (self.out_gain + step).min(1.0) };
         let gain = self.out_gain;
         frame.iter_mut().for_each(|x| *x *= gain);
         if stopping && gain <= 0.0 {
@@ -579,6 +601,7 @@ impl AudioState {
         if self.rx.overflowed() {
             self.playing = false;
             self.stopping = None;
+            self.locating = None;
             self.shared.playing.store(false, Ordering::Relaxed);
             self.shared.stop_fading.store(false, Ordering::Relaxed);
             out.fill(0.0);
@@ -625,6 +648,12 @@ impl AudioState {
             self.speaker_guard.process(frame, self.device_rate, self.shared.speaker_protection.load(Ordering::Relaxed));
             self.fade_frame(frame);
             self.read += step;
+            if self.out_gain <= 0.0
+                && let Some(at) = self.locating.take()
+            {
+                // Silent at the old position: the next frame renders from the new one.
+                self.jump_to(at);
+            }
         }
     }
 }

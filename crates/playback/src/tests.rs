@@ -1034,6 +1034,9 @@ fn locate_while_playing_drops_the_old_position_audio() {
         }
         assert!(before > 0.1, "{plugin}: the clip plays before the locate");
         tx.send(Cmd::Locate(1_000_000)).unwrap();
+        // The first callback fades the old position out (10 ms = 480 frames); then nothing of it.
+        st.fill(&mut out, 2);
+        assert!(out.chunks(2).skip(481).all(|f| f[0].abs() < 1e-6), "{plugin}: the fade-out ends in silence");
         for _ in 0..8 {
             st.fill(&mut out, 2);
             assert!(out.iter().all(|x| x.abs() < 1e-6), "{plugin}: audio from before the locate");
@@ -1548,6 +1551,51 @@ fn speaker_guard_caps_peaks_and_recovers_smoothly() {
     let mut silence = [0.0; 2];
     guard.process(&mut silence, 48_000.0, true);
     assert!(guard.gain > reduced && guard.gain < 1.0);
+}
+
+#[test]
+fn locate_while_playing_fades_out_jumps_and_fades_in() {
+    use soundcraft_model::ChannelFormat;
+    let mut st = audio_output_state(ChannelFormat::Stereo, vec![vec![0.8; 48_000]; 2]);
+    st.fades = true;
+    let fade = (48_000.0 * 0.01) as usize;
+    let mut out = vec![0.0f32; 2 * 1024];
+    st.fill(&mut out, 2);
+    let steady = out[2 * 1000];
+    assert!(steady > 0.5);
+
+    let (tx, rx) = test_channel();
+    st.rx = rx;
+    st.shared.position.store(100, Ordering::Relaxed);
+    tx.send(Cmd::Locate(100)).unwrap();
+    let mut out = vec![0.0f32; 2 * 2048];
+    st.fill(&mut out, 2);
+    let left: Vec<f32> = out.chunks(2).map(|f| f[0]).collect();
+    assert!(left[0] > steady * 0.9, "the locate fades rather than cutting");
+    assert!(left[..fade].windows(2).all(|w| w[1] <= w[0]), "the old position ramps down");
+    let silent = left.iter().position(|x| *x == 0.0).expect("the fade-out reaches silence");
+    assert!(silent <= fade + 1);
+    assert!(left[silent..silent + fade].windows(2).all(|w| w[1] >= w[0]), "the new position ramps up");
+    assert!(left[silent + fade + 1..].iter().all(|x| (x - steady).abs() < 1e-6), "full level after the fade-in");
+    assert!(st.playing && st.locating.is_none());
+    let played = (2048 - silent) as i64;
+    assert!(st.pos >= 100 + played - 1 && st.pos <= 100 + played + 512, "playback continued from the target: {}", st.pos);
+}
+
+#[test]
+fn locate_then_stop_during_the_fade_stops_at_the_target() {
+    use soundcraft_model::ChannelFormat;
+    let mut st = audio_output_state(ChannelFormat::Stereo, vec![vec![0.8; 48_000]; 2]);
+    st.fades = true;
+    let mut out = vec![0.0f32; 2 * 1024];
+    st.fill(&mut out, 2);
+    let (tx, rx) = test_channel();
+    st.rx = rx;
+    tx.send(Cmd::Locate(7)).unwrap();
+    tx.send(Cmd::Stop).unwrap();
+    st.fill(&mut out, 2);
+    assert!(!st.playing && st.locating.is_none());
+    assert_eq!(st.pos, 7, "a stop during a locate's fade stops where the locate pointed");
 }
 
 #[test]
