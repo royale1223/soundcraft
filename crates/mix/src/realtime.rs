@@ -120,13 +120,16 @@ fn transfer_slot(next: &mut Option<PluginSlot>, old: &mut Option<PluginSlot>) ->
     if next.applied_keys == old.applied_keys {
         // Retain values already applied to the live plugin. Subsequent document values still
         // flow through apply_values, so real edits update smoothers instead of resetting them.
-        std::mem::swap(next, old);
-    } else {
-        // Keep the newly prepared cache shape. Its NaNs force every new parameter identity to
-        // be applied, even if the old cache happened to contain the same numeric value.
-        std::mem::swap(&mut next.plugin, &mut old.plugin);
-        std::mem::swap(&mut next.failed, &mut old.failed);
+        std::mem::swap(&mut next.applied, &mut old.applied);
     }
+    // Keep the new parameter identities and their prepared cache when its shape changed.
+    // Retain the larger lane scratch even when parameter identities stayed the same: an
+    // automation-only edit can require more storage without changing the plugin parameters.
+    if old.lanes.capacity() > next.lanes.capacity() {
+        std::mem::swap(&mut next.lanes, &mut old.lanes);
+    }
+    std::mem::swap(&mut next.plugin, &mut old.plugin);
+    std::mem::swap(&mut next.failed, &mut old.failed);
     true
 }
 

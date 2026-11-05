@@ -15,8 +15,9 @@ pub fn is_third_party(id: &str) -> bool {
     }
     #[cfg(not(feature = "plugin-hosts"))]
     {
-        let _ = id;
-        false
+        // Recognizing a stored hosted ID does not enable loading it. Keep the same
+        // classification in mobile builds so commands can explain why it is refused.
+        id.starts_with("clap:") || id.starts_with("vst3:") || id.starts_with("au:")
     }
 }
 
@@ -76,7 +77,23 @@ pub struct NewInstance {
 /// Creates a plugin (built-in or hosted), restores `state` (if any) and prepares it. Expensive
 /// for third-party plugins: in realtime use, call it on the control thread.
 pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_block: usize, ch: usize) -> Option<NewInstance> {
+    create_instance_for(id, state, sample_rate, max_block, ch, false)
+}
+
+/// [`create_instance`] for an engine that renders offline (`offline`) or in realtime: the plugin
+/// is told which before it is prepared ([`Plugin::set_offline`]).
+pub(crate) fn create_instance_for(
+    id: &str,
+    state: Option<&[u8]>,
+    sample_rate: f32,
+    max_block: usize,
+    ch: usize,
+    offline: bool,
+) -> Option<NewInstance> {
     let mut plugin = create_plugin(id)?;
+    if offline {
+        plugin.set_offline(true);
+    }
     let refused_state = state.is_some_and(|st| !plugin.load_state(st));
     if refused_state {
         log::warn!("{id}: the plugin did not accept its stored state");

@@ -352,14 +352,12 @@ fn inserts_process_and_survive_unknown_plugins() {
 }
 
 /// A built-in gain behind a third-party id, with a log of parameter sets.
-#[cfg(feature = "plugin-hosts")]
 struct Stateful {
     inner: Box<dyn Plugin>,
     blob: Vec<u8>,
     sets: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(feature = "plugin-hosts")]
 impl Plugin for Stateful {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
         self.inner.info()
@@ -386,13 +384,11 @@ impl Plugin for Stateful {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 struct Clock {
     inner: Box<dyn Plugin>,
     seen: Arc<std::sync::Mutex<Vec<Transport>>>,
 }
 
-#[cfg(feature = "plugin-hosts")]
 impl Plugin for Clock {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
         self.inner.info()
@@ -417,7 +413,6 @@ impl Plugin for Clock {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn plugins_get_the_session_transport() {
     let (mut s, t) = session_with_dc(0.5, 48_000 * 4);
@@ -440,13 +435,11 @@ fn plugins_get_the_session_transport() {
     assert!(!seen[1].playing);
 }
 
-#[cfg(feature = "plugin-hosts")]
 struct Ears {
     inner: Box<dyn Plugin>,
     heard: Arc<std::sync::Mutex<Vec<(usize, [u8; 3])>>>,
 }
 
-#[cfg(feature = "plugin-hosts")]
 impl Plugin for Ears {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
         self.inner.info()
@@ -471,7 +464,6 @@ impl Plugin for Ears {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn controllers_play_at_their_offsets_and_are_chased_after_a_seek() {
     let mut s = Session::default();
@@ -495,13 +487,11 @@ fn controllers_play_at_their_offsets_and_are_chased_after_a_seek() {
     assert!(heard.lock().unwrap().is_empty());
 }
 
-#[cfg(feature = "plugin-hosts")]
 struct Keys {
     inner: Box<dyn Plugin>,
     heard: Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
 }
 
-#[cfg(feature = "plugin-hosts")]
 impl Plugin for Keys {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
         self.inner.info()
@@ -526,7 +516,6 @@ impl Plugin for Keys {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn real_time_properties_reach_the_instrument() {
     let mut s = Session::default();
@@ -547,7 +536,6 @@ fn real_time_properties_reach_the_instrument() {
     assert_eq!(*heard.lock().unwrap(), vec![(72, 80)]);
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn notes_held_across_a_seek_are_struck_again() {
     let mut s = Session::default();
@@ -578,14 +566,12 @@ fn notes_held_across_a_seek_are_struck_again() {
     assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(67, 90)]);
 }
 
-#[cfg(feature = "plugin-hosts")]
 fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
     let mut out = vec![vec![0.0f32; 512]; 2];
     eng.render(s, pos, 512, &mut out);
     out[0][500]
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn external_instances_are_adopted_and_retired() {
     let (mut s, t) = session_with_dc(0.5, 48_000);
@@ -628,10 +614,8 @@ fn external_instances_are_adopted_and_retired() {
     assert!(eng.drain_plugins().is_empty());
 }
 
-#[cfg(feature = "plugin-hosts")]
 struct Nan(Box<dyn Plugin>);
 
-#[cfg(feature = "plugin-hosts")]
 impl Plugin for Nan {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
         self.0.info()
@@ -656,12 +640,10 @@ impl Plugin for Nan {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 fn nan(track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
     vec![PreparedInstance { track, slot, id: "clap:test.nan".into(), ch, plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())) }]
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn an_insert_that_puts_out_nan_is_taken_out_until_the_next_reset() {
     let (mut s, a) = session_with_dc(0.5, 48_000);
@@ -681,7 +663,6 @@ fn an_insert_that_puts_out_nan_is_taken_out_until_the_next_reset() {
     assert_eq!(eng.meters[&a].plugin_failures.count, 2);
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn nan_from_an_instrument_or_a_master_insert_is_contained() {
     let mut s = synth_session(-6.0);
@@ -703,7 +684,6 @@ fn nan_from_an_instrument_or_a_master_insert_is_contained() {
     assert_eq!(render_block(&mut eng, &s, 1024), only_b);
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn failed_inserts_stop_contributing_latency_until_reset() {
     for kind in [TrackKind::Audio, TrackKind::Aux, TrackKind::Folder, TrackKind::Master] {
@@ -761,7 +741,6 @@ fn failed_inserts_stop_contributing_latency_until_reset() {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn a_new_instance_replaces_a_matching_one_in_its_slot() {
     // The host removed and re-added the plugin, and both session updates reached the audio
@@ -788,7 +767,6 @@ fn a_new_instance_replaces_a_matching_one_in_its_slot() {
     assert_eq!(retired[0].save_state(), Some(b"old".to_vec()), "the new instance stays");
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn stored_state_comes_first_then_session_params() {
     let (mut s, t) = session_with_dc(0.5, 48_000);
@@ -984,7 +962,6 @@ fn offline_renders_line_up_with_the_timeline_in_any_block_size() {
     }
 }
 
-#[cfg(feature = "plugin-hosts")]
 #[test]
 fn a_plugins_bogus_latency_is_capped() {
     struct Latent(Box<dyn Plugin>);
@@ -1134,6 +1111,30 @@ fn preparation_retains_buffers_and_parameter_caches_on_first_render() {
     let mut reference = vec![vec![0.0; 512]; 2];
     lazy.render(&session, 0, 512, &mut reference);
     assert_eq!(prepared, reference, "preparation must preserve the shared render path");
+}
+
+#[test]
+fn automation_lane_growth_prepares_scratch_before_rendering() {
+    let (mut session, track) = session_with_dc(0.5, 4800);
+    let mut insert = Insert::new("gain");
+    insert.params.insert("gain".into(), -6.0);
+    session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
+    let mut engine = MixEngine::new(48_000.0, 512);
+    let mut output = vec![vec![0.0; 512]; 2];
+    engine.ensure_synced(&session);
+    for count in [1, 32, 0, 64] {
+        let t = session.track_mut(track).unwrap();
+        t.automation.clear();
+        let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: 0, param: "gain".into() });
+        lane.set_point(0, -12.0);
+        t.automation.extend(std::iter::repeat_n(lane, count));
+        engine.ensure_synced(&session);
+        let slot = engine.strips[&track].plugins[0].as_ref().unwrap();
+        assert!(slot.lanes.capacity() >= count, "lane growth must be prepared before render");
+        let scratch = slot.lanes.as_ptr();
+        engine.render(&session, 0, 512, &mut output);
+        assert_eq!(engine.strips[&track].plugins[0].as_ref().unwrap().lanes.as_ptr(), scratch);
+    }
 }
 
 #[test]

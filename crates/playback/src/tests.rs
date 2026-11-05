@@ -1300,6 +1300,10 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
     for block in 0..8 {
         if block == 1 {
             let track = session.track_mut(latent).unwrap();
+            // Grow automation on the existing slot without changing its parameter names.
+            // A whole-slot handoff would replace the new scratch with the smaller live Vec.
+            let original = track.automation[0].clone();
+            track.automation.extend(std::iter::repeat_n(original, 32));
             let mut compressor = Insert::new("compressor");
             compressor.params.insert("lookahead".into(), 0.0);
             track.mixer.inserts[1] = Some(compressor);
@@ -1312,6 +1316,19 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
             // At position zero both latencies are zero, but their combined future maximum
             // exceeds the old graph's capacity. Handoff must keep the larger new storage.
             tx.send(session_command(Arc::new(session.clone()), Vec::new(), 0)).unwrap();
+        }
+        if block == 2 || block == 3 {
+            let track = session.track_mut(latent).unwrap();
+            if block == 2 {
+                track.automation.retain(|l| matches!(&l.param, AutoParam::Plugin { slot: 1, .. }));
+            } else {
+                let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: 0, param: "lookahead".into() });
+                for (pos, value) in [(0, 0.0), (128, 10.0), (256, 0.0), (512, 10.0), (768, 0.0)] {
+                    lane.set_point(pos, value);
+                }
+                track.automation.extend(std::iter::repeat_n(lane, 64));
+            }
+            tx.send(session_command(Arc::new(session.clone()), Vec::new(), block as i64 * 128)).unwrap();
         }
         let allocations = allocation_counter::measure(|| guarded_block(&fault, &shared, &mut output, |out| state.fill(out, 2)));
         reference.render(&session, block as i64 * 128, 128, &mut expected);
