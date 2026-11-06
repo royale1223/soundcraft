@@ -1075,6 +1075,10 @@ fn armed_tracks_are_heard_and_metered_after_playback_stops() {
     st.fill(&mut out, 2);
     assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
     assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    tx.send(Cmd::Stop).unwrap();
+    ring.push(&[0.5; 4096]);
+    st.fill(&mut out, 2);
+    assert!(out.iter().any(|x| x.abs() > 0.1), "ordinary transport stop keeps live monitoring audible");
 }
 
 #[cfg(not(feature = "plugin-hosts"))]
@@ -1643,4 +1647,58 @@ fn playback_fades_in_on_play_and_out_on_stop() {
     assert!(!st.shared.stop_fading.load(Ordering::Relaxed), "the player can be dropped now");
     assert!(!st.shared.playing.load(Ordering::Relaxed), "the transport read stopped throughout");
     assert_eq!(st.pos, stopped_at, "the fade's extra frames do not move the stop position");
+}
+
+#[test]
+fn output_shutdown_fades_monitored_recording_and_idle_input_without_callback_allocations() {
+    use soundcraft_model::ChannelFormat;
+    for playing in [true, false] {
+        for rate in [44_100, 48_000] {
+            // Existing audio on the armed track must never burst through at Stop.
+            // Opposite polarity makes any switch back to the old take detectable.
+            let base = audio_output_state(ChannelFormat::Mono, vec![vec![-0.25; 4096]]);
+            let mut session = (*base.session).clone();
+            let track = session.tracks[0].id;
+            session.track_mut(track).unwrap().mixer.record_arm = true;
+            let shared = Arc::clone(&base.shared);
+            prepare_meter_layout(&shared, &session);
+            let (tx, rx) = test_channel();
+            let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(session), f64::from(rate), sync_channel(RETIRED_PLUGINS).0);
+            let ring = record::InputRing::new(1, 48_000);
+            tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
+            tx.send(Cmd::Recording(true)).unwrap();
+            if playing {
+                // Shutdown must complete even when playback would otherwise hit its end.
+                tx.send(Cmd::Play { from: 0, end: Some(200), looped: None }).unwrap();
+            }
+            let mut out = [0.0; 128 * 2];
+            ring.push(&[0.5; 2048]);
+            st.fill(&mut out, 2);
+            let steady = out[254];
+            assert!(steady > 0.1, "live input must be audible before shutdown");
+            let stopped_at = st.pos;
+            shared.stop_fading.store(true, Ordering::Relaxed);
+            tx.send(Cmd::StopOutput).unwrap();
+            let mut previous = steady;
+            for block in 0..8 {
+                ring.push(&[0.5; 2048]);
+                let allocations = allocation_counter::measure(|| st.fill(&mut out, 2));
+                assert_eq!(allocations.count_total, 0, "shutdown allocated");
+                assert_eq!(allocations.count_current, 0, "shutdown freed callback state");
+                for frame in out.chunks_exact(2) {
+                    assert!(frame[0] >= 0.0 && frame[0] <= previous + 1e-6, "shutdown must ramp monotonically to silence");
+                    previous = frame[0];
+                }
+                if block == 0 {
+                    assert!(out[0] > steady * 0.9, "shutdown must not cut live input abruptly");
+                    assert!(shared.stop_fading.load(Ordering::Relaxed), "do not release the stream mid-fade");
+                }
+            }
+            assert_eq!(previous, 0.0);
+            assert!(out.iter().all(|x| *x == 0.0), "fresh mic input must stay silent after shutdown");
+            assert!(!shared.stop_fading.load(Ordering::Relaxed));
+            assert!(!st.playing);
+            assert_eq!(st.pos, stopped_at, "fade frames must not move the stop position");
+        }
+    }
 }

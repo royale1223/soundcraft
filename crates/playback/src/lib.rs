@@ -220,6 +220,7 @@ enum Cmd {
         looped: Option<Range>,
     },
     Stop,
+    StopOutput,
     Locate(Samples),
 }
 
@@ -618,6 +619,15 @@ impl Player {
         self.shared.playing.store(false, Ordering::Relaxed);
         self.shared.stop_fading.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Stop);
+    }
+
+    /// Fade playback and live monitoring to silence before releasing the output stream.
+    /// Unlike transport stop, this also silences input monitoring. Wait with
+    /// [`Player::wait_stopped`] before dropping the player.
+    pub fn stop_output(&self) {
+        self.shared.playing.store(false, Ordering::Relaxed);
+        self.shared.stop_fading.store(true, Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::StopOutput);
     }
 
     /// Wait (on the control thread) until a requested stop has faded out, for at most `timeout`.

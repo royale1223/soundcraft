@@ -96,6 +96,8 @@ pub(crate) struct AudioState {
     pub(crate) out_gain: f32,
     /// A stop fading out: the position playback stopped at, restored once the fade ends.
     pub(crate) stopping: Option<Samples>,
+    /// Stream shutdown also silences live input after the stop fade completes.
+    output_shutdown: bool,
     /// A locate during playback fading out at the old position: the position to jump to once
     /// silent, after which the output fades back in. Jumping mid-waveform clicked.
     pub(crate) locating: Option<Samples>,
@@ -269,6 +271,7 @@ impl AudioState {
             speaker_guard: SpeakerGuard { gain: 1.0 },
             out_gain: 1.0,
             stopping: None,
+            output_shutdown: false,
             locating: None,
             fades: true,
             feedback_guard: FeedbackGuard { hot_blocks: 0, gain: 1.0, previous_rms: 0.0 },
@@ -359,6 +362,7 @@ impl AudioState {
                 }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
+                    self.output_shutdown = false;
                     // Start from silence and fade in, unless a monitored input is already sounding
                     // (fading the whole output would dip it).
                     self.out_gain = if self.monitoring() || !self.fades { 1.0 } else { 0.0 };
@@ -377,6 +381,20 @@ impl AudioState {
                         // Fade out over the next frames; `fill` finishes the stop.
                         if self.stopping.is_none() {
                             // A pending locate's target is where the transport already reads.
+                            self.stopping = Some(self.locating.take().unwrap_or(self.pos));
+                        }
+                    } else {
+                        self.finish_stop();
+                    }
+                }
+                Cmd::StopOutput => {
+                    let sounding = self.playing || self.monitoring();
+                    self.output_shutdown = true;
+                    // Keep rendering through the fade even near a scheduled recording end.
+                    self.end = None;
+                    self.looped = None;
+                    if sounding && self.fades {
+                        if self.stopping.is_none() {
                             self.stopping = Some(self.locating.take().unwrap_or(self.pos));
                         }
                     } else {
@@ -543,7 +561,9 @@ impl AudioState {
 
     /// A monitored input is live, so output fades would dip it.
     fn monitoring(&self) -> bool {
-        self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
+        (!self.output_shutdown || self.stopping.is_some())
+            && self.input.is_some()
+            && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
     }
 
     /// Continue from `at`, dropping audio rendered for the old position and effect tails.
@@ -564,13 +584,17 @@ impl AudioState {
         if let Some(at) = self.stopping.take() {
             self.pos = at;
         }
-        self.out_gain = 1.0;
+        self.out_gain = if self.output_shutdown { 0.0 } else { 1.0 };
         self.shared.stop_fading.store(false, Ordering::Relaxed);
     }
 
     /// Ramp the output gain one frame toward its target: down to silence while stopping (finishing
     /// the stop there) or locating, otherwise up to full level. Bounded per-frame work, no allocation.
     fn fade_frame(&mut self, frame: &mut [f32]) {
+        if self.output_shutdown && self.stopping.is_none() {
+            frame.fill(0.0);
+            return;
+        }
         let stopping = self.stopping.is_some();
         let down = stopping || self.locating.is_some();
         if !down && self.out_gain >= 1.0 {
@@ -609,7 +633,7 @@ impl AudioState {
         }
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let monitoring = self.monitoring();
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             self.unsent.silence();
@@ -623,6 +647,7 @@ impl AudioState {
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
         for frame in out.chunks_mut(channels) {
+            let monitoring = monitoring && (!self.output_shutdown || self.stopping.is_some());
             while self.read >= self.pending_len as f64 {
                 self.read -= self.pending_len as f64;
                 if !self.playing && !monitoring {
