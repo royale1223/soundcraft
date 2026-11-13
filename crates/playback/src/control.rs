@@ -20,6 +20,7 @@ impl<T> fmt::Debug for SendError<T> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn channel<T>() -> (Sender<T>, Receiver<T>) {
     channel_with_capacity(8)
 }

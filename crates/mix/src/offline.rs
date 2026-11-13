@@ -54,6 +54,25 @@ pub struct RangeRender {
 }
 
 impl RangeRender {
+    /// A separately prepared offline graph, including every hosted slot.
+    /// Callers must create fresh offline processors, restore their committed
+    /// state and prepare them at `s.sample_rate` and the clamped render block
+    /// size before transfer. Live instances may never be borrowed concurrently.
+    pub fn with_prepared_instances(
+        s: &Session,
+        bus: Option<BusId>,
+        range: Range,
+        block: usize,
+        instances: Vec<super::PreparedInstance>,
+    ) -> Result<Self, String> {
+        super::validate_prepared_instances(s, &instances)?;
+        let mut render = Self::new(s, bus, range, block);
+        render.eng.set_external_instances(true);
+        render.eng.adopt(instances);
+        render.eng.ensure_synced(s);
+        Ok(render)
+    }
+
     /// Renders the main mix over `range`, or `bus` when one is named.
     pub fn new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Self {
         let nch = source_channels(s, bus);

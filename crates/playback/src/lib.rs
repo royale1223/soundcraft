@@ -84,8 +84,8 @@ fn session_command(s: Arc<Session>, instances: Vec<PreparedInstance>, pos: Sampl
     }
     #[cfg(not(feature = "plugin-hosts"))]
     {
-        let _ = instances;
         let mut mix = Box::new(new_engine(s.sample_rate.as_f64() as f32));
+        mix.adopt(instances);
         mix.prepare_realtime(&s, pos);
         Cmd::Session(s, mix, meters)
     }
@@ -211,6 +211,9 @@ pub type PluginStates = Vec<(TrackId, usize, Vec<u8>)>;
 /// A parameter edit made in a plugin's own editor: `(track, slot, param id, value)`.
 pub type EditorEdit = (TrackId, usize, String, f32);
 
+// MIDI is inline so consuming a batch never frees a heap payload on the audio
+// thread. The mobile ring has a fixed 64-entry capacity (about 26 KiB total).
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread) and the
     /// audio-side meter accumulator shaped for it.
@@ -301,6 +304,18 @@ impl Player {
         // Hand the initial session's third-party plugins over.
         p.update_session(session);
         p
+    }
+
+    /// Open output with a complete externally prepared hosted graph (e.g.
+    /// asynchronously loaded mobile AUv3 units). No desktop factory is enabled.
+    /// Instances must match the session rate, channel layouts and 512-frame
+    /// internal render quantum; all preparation happens before this call.
+    pub fn with_prepared_instances(session: Arc<Session>, cfg: &AudioConfig, instances: Vec<PreparedInstance>) -> Result<Player, String> {
+        soundcraft_mix::validate_prepared_instances(&session, &instances)?;
+        let player = Player::open(Arc::clone(&session), cfg);
+        player.side().return_old_sessions(&player.tx);
+        player.update_session_prepared(session, instances)?;
+        Ok(player)
     }
 
     /// What stopped the audio output, once: a bug in the engine, or the device went away or
@@ -505,6 +520,22 @@ impl Player {
         let instances = self.side().prepare(&s);
         prepare_meter_layout(&self.shared, &s);
         let _ = self.tx.send(session_command(s, instances, self.position()));
+    }
+
+    /// Atomically hand over a complete fresh hosted graph after asynchronous
+    /// creation has finished. Missing, duplicate or stale slots are refused on
+    /// the control thread. A same-id replacement retains its new DSP/state.
+    /// Mobile hosts must use this method for hosted sessions; `update_session`
+    /// only knows the synchronous built-in/desktop factories.
+    pub fn update_session_prepared(&self, s: Arc<Session>, mut instances: Vec<PreparedInstance>) -> Result<(), String> {
+        soundcraft_mix::validate_prepared_instances(&s, &instances)?;
+        let mut side = self.side();
+        side.collect_garbage();
+        let registration = Side::prepare_registration(&s, &mut instances);
+        prepare_meter_layout(&self.shared, &s);
+        self.tx.send(session_command(s, instances, self.position())).map_err(|_| "audio command queue unavailable or full".to_string())?;
+        side.register_prepared(registration);
+        Ok(())
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.

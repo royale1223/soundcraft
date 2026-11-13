@@ -72,15 +72,20 @@ impl MixEngine {
         std::mem::swap(&mut self.input, &mut previous.input);
         for (id, strip) in &mut self.strips {
             let Some(old) = previous.strips.get_mut(id) else { continue };
-            for (next, old) in strip.plugins.iter_mut().zip(&mut old.plugins) {
-                transfer_slot(next, old);
+            for (slot, (next, old)) in strip.plugins.iter_mut().zip(&mut old.plugins).enumerate() {
+                if !self.fresh_external.contains(&(*id, slot)) {
+                    transfer_slot(next, old);
+                }
             }
             let same_sample = match (&strip.sample, &old.sample) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
                 _ => false,
             };
-            if same_sample && transfer_slot(&mut strip.instrument, &mut old.instrument) {
+            if same_sample
+                && !self.fresh_external.contains(&(*id, super::INSTRUMENT_SLOT))
+                && transfer_slot(&mut strip.instrument, &mut old.instrument)
+            {
                 std::mem::swap(&mut strip.held, &mut old.held);
                 strip.chase = old.chase;
             }

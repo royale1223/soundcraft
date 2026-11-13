@@ -75,7 +75,10 @@ mod strip;
 mod threads;
 
 use automation::{GainRamp, pan_at, pan_segment, send_level, transport_at, volume_db_at};
-pub use instances::{INSTRUMENT_SLOT, InstanceSpec, NewInstance, PluginFailures, PreparedInstance, create_instance, instance_specs, is_third_party};
+pub use instances::{
+    INSTRUMENT_SLOT, InstanceSpec, NewInstance, PluginFailures, PreparedInstance, create_instance, instance_specs, is_third_party,
+    validate_prepared_instances,
+};
 pub use meter::StripMeter;
 use midi::sync_sample;
 pub use offline::{
@@ -165,6 +168,10 @@ pub struct MixEngine {
     offline: bool,
     /// Instances handed over by the host, waiting for `sync` to place them.
     adopt: HashMap<(TrackId, usize), PreparedInstance>,
+    /// Explicitly prepared replacements must win over runtime inheritance,
+    /// even when the new instance has the same component id and channel count.
+    #[cfg(not(feature = "plugin-hosts"))]
+    fresh_external: std::collections::HashSet<(TrackId, usize)>,
     /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
@@ -202,6 +209,8 @@ impl MixEngine {
             external: false,
             offline: false,
             adopt: HashMap::new(),
+            #[cfg(not(feature = "plugin-hosts"))]
+            fresh_external: std::collections::HashSet::new(),
             retired: Vec::new(),
             work: Vec::new(),
         }
@@ -225,6 +234,8 @@ impl MixEngine {
             return;
         }
         for p in instances {
+            #[cfg(not(feature = "plugin-hosts"))]
+            self.fresh_external.insert((p.track, p.slot));
             if let Some(old) = self.adopt.insert((p.track, p.slot), p) {
                 self.retired.push(old.plugin);
             }

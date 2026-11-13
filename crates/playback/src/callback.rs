@@ -757,6 +757,16 @@ pub(crate) struct Side {
     old_sessions: Option<ReturnReceiver<RetiredSession>>,
 }
 
+/// Control-only handles staged before enqueue, committed only when the graph
+/// command is accepted. A full queue must not replace the active save/editor
+/// registry with handles for processors which never reached the callback.
+pub(crate) struct PreparedRegistration {
+    rate: f32,
+    shadow: HashMap<(TrackId, usize), (String, usize, bool)>,
+    editors: HashMap<(TrackId, usize), Box<dyn PluginEditor>>,
+    states: BTreeMap<(TrackId, usize), Box<dyn PluginStateReader>>,
+}
+
 impl Side {
     pub(crate) fn new(rate: f32, garbage: MpscReceiver<Vec<Box<dyn Plugin>>>) -> Side {
         Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
@@ -820,6 +830,39 @@ pub(crate) fn prepare_meter_layout(shared: &Shared, session: &Session) {
 }
 
 impl Side {
+    /// Extract control-only handles without changing the active registry.
+    pub(crate) fn prepare_registration(session: &Session, instances: &mut [PreparedInstance]) -> PreparedRegistration {
+        let mut registration = PreparedRegistration {
+            rate: session.sample_rate.as_f64() as f32,
+            shadow: HashMap::new(),
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+        };
+        for instance in instances {
+            let key = (instance.track, instance.slot);
+            if let Some(mut editor) = instance.plugin.editor() {
+                let _ = editor.state_changed();
+                registration.editors.insert(key, editor);
+            }
+            if let Some(reader) = instance.plugin.state_reader() {
+                registration.states.insert(key, reader);
+            }
+            registration.shadow.insert(key, (instance.id.clone(), instance.ch, true));
+        }
+        registration
+    }
+
+    pub(crate) fn register_prepared(&mut self, registration: PreparedRegistration) {
+        let stale: Vec<_> = self.shadow.keys().copied().collect();
+        for key in stale {
+            self.forget(key);
+        }
+        self.rate = registration.rate;
+        self.shadow = registration.shadow;
+        self.editors = registration.editors;
+        self.states = registration.states;
+    }
+
     pub(crate) fn capture_states(&mut self) -> PluginStates {
         self.states.iter_mut().filter(|(k, _)| !self.refused.contains(*k)).filter_map(|(&(t, slot), r)| Some((t, slot, r.save_state()?))).collect()
     }

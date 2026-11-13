@@ -592,6 +592,73 @@ fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
 }
 
 #[test]
+fn auv3_prepared_offline_instance_uses_shared_compensation_and_exact_range() {
+    // Time Shift is a creative delay and deliberately reports zero algorithmic
+    // latency. This fixture delegates its DSP but declares the three samples
+    // as host-compensated latency, like the native test extension.
+    struct AlgorithmicDelay(Box<dyn Plugin>);
+    impl Plugin for AlgorithmicDelay {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.0.info()
+        }
+        fn prepare(&mut self, sr: f32, block: usize, ch: usize) {
+            self.0.prepare(sr, block, ch);
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn set_param(&mut self, id: &str, value: f32) -> bool {
+            self.0.set_param(id, value)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.0.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.0.process(io, frames);
+        }
+        fn latency(&self) -> usize {
+            3
+        }
+    }
+    assert!(is_third_party("auv3:61756678:74657374:4c446177"));
+    let (mut session, track) = session_with_dc(0.5, 4096);
+    let reference = render_range(&session, Range::new(0, 1024), 128);
+    let id = "auv3:61756678:74657374:4c446177";
+    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
+    // Use SoundCraft's own fixed-delay processor as the fake asynchronously
+    // prepared unit. Real plugin loading is deliberately absent from tests.
+    let mut delay = soundcraft_dsp::create("time_shift").unwrap();
+    assert!(delay.set_param("delay_samples", 3.0));
+    delay.prepare(48_000.0, 128, 1);
+    let instance = PreparedInstance { track, slot: 0, id: id.into(), ch: 1, plugin: Box::new(AlgorithmicDelay(delay)) };
+    let mut render = RangeRender::with_prepared_instances(&session, None, Range::new(0, 1024), 128, vec![instance]).unwrap();
+    let mut actual = vec![Vec::new(), Vec::new()];
+    while let Some((block, frames)) = render.next_block(&session) {
+        for (out, channel) in actual.iter_mut().zip(block) {
+            out.extend_from_slice(&channel[..frames]);
+        }
+    }
+    assert_eq!(actual, reference, "the hosted delay must be trimmed by the shared offline mixer");
+}
+
+#[test]
+fn auv3_prepared_graph_rejects_missing_duplicate_stale_and_wrong_layout_slots() {
+    let (mut session, track) = session_with_dc(0.5, 4096);
+    let id = "auv3:61756678:74657374:4c446177";
+    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
+    let make = |slot, ch, id: &str| PreparedInstance { track, slot, id: id.into(), ch, plugin: soundcraft_dsp::create("gain").unwrap() };
+    assert!(validate_prepared_instances(&session, &[]).is_err());
+    assert!(validate_prepared_instances(&session, &[make(0, 2, id)]).is_err());
+    assert!(validate_prepared_instances(&session, &[make(3, 1, id)]).is_err());
+    assert!(validate_prepared_instances(&session, &[make(0, 1, "auv3:stale")]).is_err());
+    assert!(validate_prepared_instances(&session, &[make(0, 1, id)]).is_ok());
+    session.track_mut(track).unwrap().mixer.inserts[1] = Some(Insert::new(id));
+    assert!(validate_prepared_instances(&session, &[make(0, 1, id), make(0, 1, id)]).is_err());
+    assert!(validate_prepared_instances(&session, &[make(0, 1, id), make(1, 1, id)]).is_ok());
+    assert!(RangeRender::with_prepared_instances(&session, None, Range::new(0, 1024), 128, Vec::new()).is_err());
+}
+
+#[test]
 fn external_instances_are_adopted_and_retired() {
     let (mut s, t) = session_with_dc(0.5, 48_000);
     let mut ins = Insert::new("clap:test.fake");

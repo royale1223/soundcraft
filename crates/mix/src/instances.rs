@@ -7,6 +7,11 @@ pub const INSTRUMENT_SLOT: usize = usize::MAX;
 
 /// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
 pub fn is_third_party(id: &str) -> bool {
+    // Mobile hosts inject asynchronously prepared AUv3 instances. Recognition
+    // must not depend on enabling the desktop AUv2/CLAP/VST3 factories.
+    if id.starts_with("auv3:") {
+        return true;
+    }
     #[cfg(feature = "plugin-hosts")]
     {
         id.starts_with(soundcraft_clap_host::ID_PREFIX)
@@ -42,6 +47,34 @@ pub struct PreparedInstance {
     pub id: String,
     pub ch: usize,
     pub plugin: Box<dyn Plugin>,
+}
+
+/// Validate one complete, already prepared replacement graph on its control
+/// thread. This rejects missing/misrouted units rather than silently exporting
+/// or playing a partially loaded hosted graph. The caller must have prepared
+/// each processor at the session rate and the destination's maximum block size.
+pub fn validate_prepared_instances(s: &Session, instances: &[PreparedInstance]) -> Result<(), String> {
+    let specs = instance_specs(s);
+    if specs.len() != instances.len() {
+        return Err(format!("expected {} prepared hosted instances, got {}", specs.len(), instances.len()));
+    }
+    let expected: std::collections::HashMap<_, _> = specs.iter().map(|s| ((s.track, s.slot), s)).collect();
+    let mut seen = std::collections::HashSet::new();
+    for instance in instances {
+        let key = (instance.track, instance.slot);
+        if !seen.insert(key) {
+            return Err("duplicate prepared hosted slot".into());
+        }
+        let Some(spec) = expected.get(&key) else { return Err("prepared hosted slot is no longer in the session".into()) };
+        if instance.id != spec.id || instance.ch != spec.ch {
+            return Err("prepared hosted identity or channel layout differs from the session".into());
+        }
+        let maximum = instance.plugin.max_latency();
+        if maximum < instance.plugin.latency() || maximum > super::strip::MAX_LATENCY {
+            return Err("prepared hosted latency exceeds its declared compensation budget".into());
+        }
+    }
+    Ok(())
 }
 
 /// Every third-party plugin slot (inserts and instruments) of a session, with the channel count

@@ -671,6 +671,82 @@ fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec
     st
 }
 
+#[cfg(not(feature = "plugin-hosts"))]
+#[test]
+fn auv3_prepared_mobile_graph_reaches_callback_and_same_id_replacement_wins() {
+    use soundcraft_model::{ChannelFormat, Insert};
+    let mut state = audio_output_state(ChannelFormat::Stereo, vec![vec![0.5; 4096]; 2]);
+    let mut session = (*state.session).clone();
+    let track = session.tracks[0].id;
+    let id = "auv3:61756678:74657374:4c446177";
+    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
+    let session = Arc::new(session);
+    let prepared = |db| {
+        let mut gain = soundcraft_dsp::create("gain").unwrap();
+        assert!(gain.set_param("gain", db));
+        gain.prepare(48_000.0, BLOCK, 2);
+        PreparedInstance { track, slot: 0, id: id.into(), ch: 2, plugin: gain }
+    };
+    let (tx, rx) = test_channel();
+    state.rx = rx;
+    let (retire_tx, mut retire_rx) = return_channel(OLD_SESSIONS);
+    tx.send(Cmd::OldSessions(retire_tx)).unwrap();
+    // Match Player::update_session_prepared's control-thread meter shaping.
+    prepare_meter_layout(&state.shared, &session);
+    let mut output = vec![0.0; 1024];
+    for (db, expected) in [(-6.0, 0.5 * 10.0f32.powf(-6.0 / 20.0)), (-12.0, 0.5 * 10.0f32.powf(-12.0 / 20.0))] {
+        let instances = vec![prepared(db)];
+        assert!(soundcraft_mix::validate_prepared_instances(&session, &instances).is_ok());
+        tx.send(session_command(Arc::clone(&session), instances, state.pos)).unwrap();
+        tx.send(Cmd::Play { from: state.pos, end: None, looped: None }).unwrap();
+        let allocation = allocation_counter::measure(|| state.fill(&mut output, 2));
+        assert_eq!(allocation.count_total, 0, "prepared handoff must not allocate in the callback");
+        assert_eq!(allocation.count_current, 0, "replaced graph must be retired rather than freed in the callback");
+        assert!(output.iter().all(|sample| (*sample - expected).abs() < 1e-6), "{db}: {:?}", &output[..8]);
+        // Drain and destroy returned graphs on this test's control thread.
+        while let Ok(retired) = retire_rx.try_recv() {
+            drop(retired);
+        }
+    }
+}
+
+#[cfg(not(feature = "plugin-hosts"))]
+#[test]
+fn auv3_prepared_queue_failure_preserves_the_active_save_registry() {
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+    let state = audio_output_state(ChannelFormat::Mono, vec![vec![0.5; 1024]]);
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+    let id = "auv3:61756678:74657374:4c446177";
+    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
+    let (tx, rx) = control::channel_with_capacity(1);
+    tx.send(Cmd::Stop).unwrap(); // A real full mobile command queue.
+    let mut side = Side::new(48_000.0, std::sync::mpsc::channel().1);
+    side.shadow.insert((track, 0), (id.into(), 1, true));
+    side.states.insert((track, 0), Box::new(|| Some(b"active state".to_vec())));
+    let player = Player {
+        shared: Arc::clone(&state.shared),
+        fault: Arc::default(),
+        #[cfg(not(target_arch = "wasm32"))]
+        watch: Mutex::new(None),
+        tx,
+        side: Mutex::new(side),
+        _stream: None,
+        device_name: "test queue".into(),
+        device_rate: 48_000,
+        device_channels: 1,
+        device_buffer: Some(512),
+        silent: true,
+    };
+    let mut gain = soundcraft_dsp::create("gain").unwrap();
+    gain.prepare(48_000.0, BLOCK, 1);
+    let instance = PreparedInstance { track, slot: 0, id: id.into(), ch: 1, plugin: gain };
+    assert!(player.update_session_prepared(Arc::new(session), vec![instance]).is_err());
+    assert!(rx.overflowed());
+    assert_eq!(player.capture_states(), vec![(track, 0, b"active state".to_vec())]);
+    assert_eq!(player.side().shadow.get(&(track, 0)), Some(&(id.into(), 1, true)));
+}
+
 #[test]
 fn mono_device_averages_stereo_before_clipping() {
     use soundcraft_model::ChannelFormat;
