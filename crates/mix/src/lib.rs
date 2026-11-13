@@ -70,6 +70,7 @@ mod meter;
 mod midi;
 mod offline;
 mod pan;
+mod prepared_delay;
 mod routing;
 mod strip;
 mod threads;
@@ -86,6 +87,7 @@ pub use offline::{
 };
 pub use pan::itu_stereo_fold;
 use pan::{PanSpec, apply_matrix, apply_matrix_span, build_matrix};
+pub use prepared_delay::PreparedDelay;
 use routing::{processing_order, structure_fingerprint};
 #[cfg(test)]
 use strip::DelayLine;
