@@ -232,6 +232,7 @@ pub(crate) struct LiveInput<'a> {
     pub(crate) input: &'a [Vec<f32>],
     pub(crate) monitor_only: bool,
     pub(crate) recording: bool,
+    pub(crate) live_midi_track: Option<TrackId>,
 }
 
 /// The block being rendered: where it starts, its length, and whether any track is soloed.
@@ -320,7 +321,7 @@ fn read_aux_bus(t: &Track, strip: &mut Strip, busses: &HashMap<BusId, BusBuf>, f
 }
 
 /// Render the track's instrument into the strip.
-fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, transport: &Transport) {
+fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, transport: &Transport, live_only: bool) {
     let Block { pos, frames, .. } = blk;
     if let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed) {
         // #152: push the instrument's stored parameter values into the live plugin
@@ -332,11 +333,13 @@ fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, tran
             apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
         }
         inst.plugin.set_transport(transport);
-        let chase = std::mem::take(&mut strip.chase);
-        if chase {
-            chase_controllers(s, t, pos, inst);
+        if !live_only {
+            let chase = std::mem::take(&mut strip.chase);
+            if chase {
+                chase_controllers(s, t, pos, inst);
+            }
+            schedule_notes(s, t, pos, frames, inst, &mut strip.held, chase);
         }
-        schedule_notes(s, t, pos, frames, inst, &mut strip.held, chase);
         if strip.buf.len() >= 2 {
             inst.plugin.process(&mut strip.buf, frames);
         } else if let Some(c0) = strip.buf.first_mut() {
@@ -469,10 +472,13 @@ pub(crate) fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &
     match t.kind {
         TrackKind::Audio if monitored => monitor_input(t, strip, live, frames),
         TrackKind::Audio if live.monitor_only => {}
+        TrackKind::Instrument | TrackKind::Midi if live.monitor_only && live.live_midi_track == Some(t.id) => {
+            render_instrument(s, t, strip, blk, &transport, true)
+        }
         TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
         TrackKind::Audio => render_audio_clips(s, t, strip, blk),
         TrackKind::Aux | TrackKind::Folder => read_aux_bus(t, strip, busses, frames),
-        TrackKind::Instrument | TrackKind::Midi => render_instrument(s, t, strip, blk, &transport),
+        TrackKind::Instrument | TrackKind::Midi => render_instrument(s, t, strip, blk, &transport, false),
         _ => {}
     }
     let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };

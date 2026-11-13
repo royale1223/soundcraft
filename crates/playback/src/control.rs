@@ -99,6 +99,18 @@ mod tests {
     }
 
     #[test]
+    fn playback_command_ring_absorbs_a_burst_of_live_midi_batches() {
+        let (sender, mut receiver) = channel_with_capacity(crate::COMMAND_QUEUE_CAPACITY);
+        for batch in 0..48 {
+            sender.send(batch).unwrap();
+        }
+        assert!(!sender.overflowed());
+        for batch in 0..48 {
+            assert_eq!(receiver.try_recv(), Ok(batch));
+        }
+    }
+
+    #[test]
     fn full_return_ring_retains_ownership_in_the_error() {
         let (mut sender, mut receiver) = return_channel(1);
         sender.try_send(Arc::new(10)).unwrap();

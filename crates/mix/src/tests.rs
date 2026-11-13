@@ -62,6 +62,25 @@ fn stored_instrument_params_reach_the_plugin() {
 }
 
 #[test]
+fn live_midi_instrument_renders_while_stopped_across_fixed_position_blocks() {
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    let mut engine = MixEngine::new(48_000.0, 512);
+    engine.monitor_only = true;
+    engine.set_live_midi_track(Some(track));
+    engine.ensure_synced(&session);
+    assert_eq!(engine.live_midi(track, &[[0x90, 60, 100]]), 0);
+
+    let mut output = vec![vec![0.0; 512]; 2];
+    for _ in 0..4 {
+        engine.render(&session, 0, 512, &mut output);
+        assert!(output.iter().flatten().any(|sample| sample.abs() > 1e-5));
+    }
+    assert_eq!(engine.live_midi(track, &[[0x80, 60, 0]]), 0);
+}
+
+#[test]
 fn note_off_at_the_clip_end_on_a_block_boundary_releases_the_note() {
     // The note ends with its 24,000-sample clip; 480-frame blocks put that
     // note-off at the first sample of the block after the clip.

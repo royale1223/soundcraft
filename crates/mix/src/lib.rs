@@ -154,6 +154,8 @@ pub struct MixEngine {
     pub monitor_use_rack: bool,
     /// Recording: record-armed tracks hear their input (auto input).
     pub recording: bool,
+    /// Instrument receiving external MIDI while transport is stopped.
+    pub live_midi_track: Option<TrackId>,
     /// Mix the metronome (Options > Click) into the output. Playback turns this on; offline renders
     /// (bounces, stems, exports) leave it off so the click is never printed into a file.
     pub metronome: bool,
@@ -195,6 +197,7 @@ impl MixEngine {
             monitor_gain: 1.0,
             monitor_use_rack: true,
             recording: false,
+            live_midi_track: None,
             metronome: false,
             external: false,
             offline: false,
@@ -234,6 +237,39 @@ impl MixEngine {
     /// Does not allocate.
     pub fn take_retired(&mut self) -> Vec<Box<dyn Plugin>> {
         std::mem::take(&mut self.retired)
+    }
+
+    /// Select the instrument strip that receives live MIDI while transport is idle.
+    pub fn set_live_midi_track(&mut self, track: Option<TrackId>) {
+        if self.live_midi_track != track
+            && let Some(previous) = self.live_midi_track
+            && let Some(instrument) = self.strips.get_mut(&previous).and_then(|strip| strip.instrument.as_mut())
+        {
+            instrument.plugin.all_notes_off();
+        }
+        self.live_midi_track = track;
+    }
+
+    /// Deliver a bounded batch to the already prepared instrument instance. Returns the number
+    /// of messages rejected because the requested strip or instrument is unavailable.
+    pub fn live_midi(&mut self, track: TrackId, messages: &[[u8; 3]]) -> usize {
+        if self.live_midi_track != Some(track) {
+            return messages.len();
+        }
+        let Some(instrument) = self.strips.get_mut(&track).and_then(|strip| strip.instrument.as_mut()).filter(|instrument| !instrument.failed) else {
+            return messages.len();
+        };
+        for message in messages {
+            let pitch = message[1] & 0x7f;
+            let velocity = message[2] & 0x7f;
+            match message[0] & 0xf0 {
+                0x80 => instrument.plugin.note_off(0, pitch),
+                0x90 if velocity == 0 => instrument.plugin.note_off(0, pitch),
+                0x90 => instrument.plugin.note_on(0, pitch, velocity),
+                _ => instrument.plugin.midi(0, *message),
+            }
+        }
+        0
     }
 
     /// Every instance this engine holds (strips, instruments, clip effects excluded) plus the
@@ -443,6 +479,7 @@ impl MixEngine {
             input: live_input,
             monitor_only: self.monitor_only,
             recording: self.recording,
+            live_midi_track: self.live_midi_track,
             gain: self.monitor_gain,
             use_rack: self.monitor_use_rack,
         };
@@ -467,7 +504,10 @@ impl MixEngine {
     fn begin_block(&mut self, s: &Session, pos: Samples, frames: usize) {
         if pos != self.last_end {
             // Seek: silence held notes and ringing plugins.
-            for st in self.strips.values_mut() {
+            for (track, st) in &mut self.strips {
+                if self.monitor_only && self.live_midi_track == Some(*track) {
+                    continue;
+                }
                 if let Some(i) = &mut st.instrument {
                     i.plugin.all_notes_off();
                 }
@@ -571,6 +611,7 @@ impl MixEngine {
                 input: live_input,
                 monitor_only: self.monitor_only,
                 recording: self.recording,
+                live_midi_track: self.live_midi_track,
                 gain: self.monitor_gain,
                 use_rack: self.monitor_use_rack,
             };

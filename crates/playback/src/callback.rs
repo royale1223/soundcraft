@@ -324,6 +324,24 @@ impl AudioState {
                     }
                 }
                 Cmd::Recording(r) => self.recording = r,
+                Cmd::MidiMonitor(track) => {
+                    if self.playing {
+                        self.mix.set_live_midi_track(None);
+                    } else {
+                        self.mix.set_live_midi_track(track);
+                        if track.is_some() {
+                            self.output_shutdown = false;
+                            self.stopping = None;
+                            self.out_gain = 1.0;
+                            self.pending_len = 0;
+                            self.read = 0.0;
+                        }
+                    }
+                }
+                Cmd::MidiBatch { track, messages, len } => {
+                    let len = len.min(messages.len());
+                    let _ = self.mix.live_midi(track, &messages[..len]);
+                }
                 Cmd::Session(s, instances, mut meters) => {
                     session_updates += 1;
                     changed = true;
@@ -362,6 +380,7 @@ impl AudioState {
                 }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
+                    self.mix.set_live_midi_track(None);
                     self.output_shutdown = false;
                     // Start from silence and fade in, unless a monitored input is already sounding
                     // (fading the whole output would dip it).
@@ -389,6 +408,7 @@ impl AudioState {
                 }
                 Cmd::StopOutput => {
                     let sounding = self.playing || self.monitoring();
+                    self.mix.set_live_midi_track(None);
                     self.output_shutdown = true;
                     // Keep rendering through the fade even near a scheduled recording end.
                     self.end = None;
@@ -562,8 +582,8 @@ impl AudioState {
     /// A monitored input is live, so output fades would dip it.
     fn monitoring(&self) -> bool {
         (!self.output_shutdown || self.stopping.is_some())
-            && self.input.is_some()
-            && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
+            && (self.mix.live_midi_track.is_some()
+                || (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)))
     }
 
     /// Continue from `at`, dropping audio rendered for the old position and effect tails.

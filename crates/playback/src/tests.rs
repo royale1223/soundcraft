@@ -562,6 +562,37 @@ fn live_input_channel_changes_reuse_preallocated_mixer_buffers() {
 }
 
 #[test]
+fn live_midi_commands_render_the_selected_instrument_while_transport_is_idle() {
+    let mut session = soundcraft_model::Session::default();
+    let track = session.add_track(soundcraft_model::TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, None);
+    session.track_mut(track).unwrap().instrument = Some(soundcraft_model::Insert::new("subtractive_synth"));
+    let session = Arc::new(session);
+    let shared = Arc::new(Shared {
+        position: AtomicI64::new(0),
+        playing: AtomicBool::new(false),
+        speed: AtomicU32::new(1000),
+        monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+        monitor_use_rack: AtomicBool::new(true),
+        direct_monitor_enabled: AtomicBool::new(true),
+        feedback_protection: AtomicBool::new(false),
+        speaker_protection: AtomicBool::new(false),
+        stop_fading: AtomicBool::new(false),
+        meters: Mutex::new(MeterSnapshot::default()),
+    });
+    let (tx, rx) = test_channel();
+    let mut state = AudioState::new(rx, Arc::clone(&shared), session, 48_000.0, sync_channel(RETIRED_PLUGINS).0);
+    tx.send(Cmd::MidiMonitor(Some(track))).unwrap();
+    let mut messages = [[0; 3]; LIVE_MIDI_BATCH];
+    messages[0] = [0x90, 60, 100];
+    tx.send(Cmd::MidiBatch { track, messages, len: 1 }).unwrap();
+
+    let mut output = vec![0.0; 1024];
+    state.fill(&mut output, 2);
+    assert!(!shared.playing.load(Ordering::Relaxed));
+    assert!(output.iter().any(|sample| sample.abs() > 1e-5));
+}
+
+#[test]
 fn initial_session_is_synchronized_before_the_callback_starts() {
     let mut session = soundcraft_model::Session::default();
     let track = session.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);

@@ -29,8 +29,10 @@ pub mod record;
 
 pub use devices::AudioConfig;
 
+#[cfg(all(not(feature = "plugin-hosts"), test))]
+use control::channel;
 #[cfg(not(feature = "plugin-hosts"))]
-use control::{Receiver, ReturnReceiver, ReturnSender, Sender, channel, return_channel};
+use control::{Receiver, ReturnReceiver, ReturnSender, Sender, channel_with_capacity, return_channel};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId, TrackKind};
@@ -97,6 +99,9 @@ const MAX_CONTROL_COMMANDS_PER_CALLBACK: usize = 16;
 /// Retired plugin batches are collected by the UI thread. A full queue makes the callback retain
 /// the batch and temporarily render silence until the UI has room to collect it.
 const RETIRED_PLUGINS: usize = 16;
+/// Maximum MIDI messages copied into one bounded audio-thread command.
+pub const LIVE_MIDI_BATCH: usize = 128;
+const COMMAND_QUEUE_CAPACITY: usize = 64;
 
 /// Room for replaced snapshots/mixers/input rings; `update_session` collects them before sending.
 #[cfg(feature = "plugin-hosts")]
@@ -214,6 +219,12 @@ enum Cmd {
     OldSessions(ReturnSender<RetiredSession>),
     Input(Arc<record::InputRing>),
     Recording(bool),
+    MidiMonitor(Option<TrackId>),
+    MidiBatch {
+        track: TrackId,
+        messages: [[u8; 3]; LIVE_MIDI_BATCH],
+        len: usize,
+    },
     Play {
         from: Samples,
         end: Option<Samples>,
@@ -346,7 +357,7 @@ impl Player {
                     |config: &cpal::StreamConfig| -> Result<Opened, cpal::Error> {
                         let rate = config.sample_rate;
                         let channels = usize::from(config.channels);
-                        let (tx, rx) = channel();
+                        let (tx, rx) = channel_with_capacity(COMMAND_QUEUE_CAPACITY);
                         let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
                         let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
                         let fault = Arc::new(Fault::default());
@@ -388,7 +399,7 @@ impl Player {
                     }
                     None => {
                         log::warn!("no usable audio stream; using a silent clock");
-                        let (tx, rx) = channel();
+                        let (tx, rx) = channel_with_capacity(COMMAND_QUEUE_CAPACITY);
                         let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
                         Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
                     }
@@ -396,7 +407,7 @@ impl Player {
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
-                let (tx, rx) = channel();
+                let (tx, rx) = channel_with_capacity(COMMAND_QUEUE_CAPACITY);
                 let (gtx, grx) = sync_channel(RETIRED_PLUGINS);
                 Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
             }
@@ -581,6 +592,22 @@ impl Player {
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
         let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    /// Select the prepared instrument that receives external MIDI while transport is idle.
+    pub fn set_live_midi_track(&self, track: Option<TrackId>) -> bool {
+        self.tx.send(Cmd::MidiMonitor(track)).is_ok()
+    }
+
+    /// Copy a bounded MIDI batch into the callback command queue. No event vector crosses into
+    /// the callback, and a full queue is reported to the caller.
+    pub fn send_live_midi(&self, track: TrackId, messages: &[[u8; 3]]) -> bool {
+        if messages.is_empty() || messages.len() > LIVE_MIDI_BATCH {
+            return messages.is_empty();
+        }
+        let mut batch = [[0; 3]; LIVE_MIDI_BATCH];
+        batch[..messages.len()].copy_from_slice(messages);
+        self.tx.send(Cmd::MidiBatch { track, messages: batch, len: messages.len() }).is_ok()
     }
 
     /// Set post-insert listening gain without rebuilding DSP or queuing an audio command.

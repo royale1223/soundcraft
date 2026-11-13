@@ -67,6 +67,7 @@ impl MixEngine {
         self.input_channels = previous.input_channels;
         self.monitor_only = previous.monitor_only;
         self.recording = previous.recording;
+        self.live_midi_track = previous.live_midi_track;
         self.metronome = previous.metronome;
         std::mem::swap(&mut self.input, &mut previous.input);
         for (id, strip) in &mut self.strips {
