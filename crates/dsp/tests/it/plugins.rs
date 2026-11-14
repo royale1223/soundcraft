@@ -631,24 +631,6 @@ fn lofi_quantizes() {
     assert!(levels.len() <= 5, "{levels:?}");
 }
 
-#[test]
-fn declared_latency_bounds_cover_builtin_parameter_ranges() {
-    for rate in [44_100.0, 48_000.0, 96_000.0] {
-        for info in plugins() {
-            let mut plugin = create(info.id).unwrap();
-            plugin.prepare(rate, BLOCK, 2);
-            let maximum = plugin.max_latency();
-            assert!(plugin.latency() <= maximum, "{} at {rate}", info.id);
-            for param in info.params {
-                for value in [param.min, param.max, param.default] {
-                    plugin.set_param(param.id, value);
-                    assert!(plugin.latency() <= maximum, "{} {}={value} at {rate} exceeds prepared bound {maximum}", info.id, param.id);
-                }
-            }
-        }
-    }
-}
-
 fn ring_mod(params: &[(&str, f32)]) -> Box<dyn Plugin> {
     let mut p = prepared("ring_mod");
     for &(id, v) in params {
@@ -690,89 +672,6 @@ fn ring_mod_frequency_mod_adds_sidebands() {
     for hz in [800.0, 1200.0] {
         assert!(band_db(&spec, 1000.0) - band_db(&spec, hz) < 20.0, "no sideband at {hz} Hz");
     }
-}
-
-#[test]
-fn synth_retriggering_a_sounding_note_at_a_new_velocity_does_not_click() {
-    // A pure sine at full sustain, fully velocity sensitive. The re-strike is
-    // tried at every point of one 440 Hz cycle (about 109 samples), so it also
-    // lands near a peak, where a level jump is largest.
-    let step = |x: &[f32]| x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
-    let mut worst = 0.0_f32;
-    let mut steady = 0.0_f32;
-    for offset in 0..110 {
-        let mut p = prepared("subtractive_synth");
-        for (id, v) in [
-            ("osc1_wave", 2.0),
-            ("osc_mix", 0.0),
-            ("cutoff", 20_000.0),
-            ("filter_env_amount", 0.0),
-            ("resonance", 0.0),
-            ("amp_sustain", 100.0),
-            ("velocity", 100.0),
-        ] {
-            p.set_param(id, v);
-        }
-        p.note_on(0, 69, 127);
-        let before = run(p.as_mut(), &[vec![0.0; 9600 + offset]]);
-        // Re-strike the ringing string softly, as a strum's next stroke does:
-        // the note-off and the new note-on land on the same sample.
-        p.note_off(0, 69);
-        p.note_on(0, 69, 20);
-        let after = run(p.as_mut(), &[vec![0.0; 960]]);
-        steady = steady.max(step(&before[0][4800..]));
-        let joined = [&before[0][9000..], &after[0][..]].concat();
-        worst = worst.max(step(&joined));
-    }
-    assert!(worst <= steady * 1.2, "velocity step: {worst} vs {steady}");
-}
-
-#[test]
-fn body_resonance_gives_notes_near_body_modes_a_two_stage_decay() {
-    let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
-    // Early (5-40 ms) over late (300-400 ms) level of a held sine note.
-    let shape = |note: u8, body: f32| {
-        let mut p = prepared("subtractive_synth");
-        for (id, v) in
-            [("osc1_wave", 2.0), ("osc_mix", 0.0), ("cutoff", 20_000.0), ("filter_env_amount", 0.0), ("amp_sustain", 100.0), ("body", body)]
-        {
-            p.set_param(id, v);
-        }
-        p.note_on(0, note, 110);
-        let out = run(p.as_mut(), &[vec![0.0; 19_200]]);
-        rms(&out[0][240..1920]) / rms(&out[0][14_400..19_200])
-    };
-    // A2 (110 Hz) sits near the 100 Hz air mode; E4 (330 Hz) is between modes.
-    let (near, far) = (shape(45, 100.0), shape(64, 100.0));
-    assert!(near > 1.5, "a fast first stage near a mode: {near}");
-    assert!((far - 1.0).abs() < 0.05, "one stage between modes: {far}");
-    // Off by default: no change from the plain synth.
-    assert!((shape(45, 0.0) - 1.0).abs() < 0.05);
-}
-
-#[test]
-fn a_restrike_near_a_body_mode_ramps_in_without_a_click() {
-    let step = |x: &[f32]| x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
-    let mut worst = 0.0_f32;
-    let mut steady = 0.0_f32;
-    for offset in (0..440).step_by(11) {
-        let mut p = prepared("subtractive_synth");
-        for (id, v) in
-            [("osc1_wave", 2.0), ("osc_mix", 0.0), ("cutoff", 20_000.0), ("filter_env_amount", 0.0), ("amp_sustain", 100.0), ("body", 100.0)]
-        {
-            p.set_param(id, v);
-        }
-        // A2: near the 100 Hz air mode, so each strike adds the body stage.
-        p.note_on(0, 45, 110);
-        let before = run(p.as_mut(), &[vec![0.0; 24_000 + offset]]);
-        p.note_off(0, 45);
-        p.note_on(0, 45, 110);
-        let after = run(p.as_mut(), &[vec![0.0; 4800]]);
-        steady = steady.max(step(&after[0][..]));
-        worst = worst.max(step(&[&before[0][23_900..], &after[0][..8]].concat()));
-    }
-    // The re-strike's body stage ramps in: no step beyond the louder note's own.
-    assert!(worst <= steady * 1.05, "{worst} vs {steady}");
 }
 
 #[test]

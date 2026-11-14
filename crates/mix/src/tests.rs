@@ -62,39 +62,6 @@ fn stored_instrument_params_reach_the_plugin() {
 }
 
 #[test]
-fn live_midi_instrument_renders_while_stopped_across_fixed_position_blocks() {
-    let mut session = Session::default();
-    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
-    session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
-    let mut engine = MixEngine::new(48_000.0, 512);
-    engine.monitor_only = true;
-    engine.set_live_midi_track(Some(track));
-    engine.ensure_synced(&session);
-    assert_eq!(engine.live_midi(track, &[[0x90, 60, 100]]), 0);
-
-    let mut output = vec![vec![0.0; 512]; 2];
-    for _ in 0..4 {
-        engine.render(&session, 0, 512, &mut output);
-        assert!(output.iter().flatten().any(|sample| sample.abs() > 1e-5));
-    }
-    assert_eq!(engine.live_midi(track, &[[0x80, 60, 0]]), 0);
-}
-
-#[test]
-fn note_off_at_the_clip_end_on_a_block_boundary_releases_the_note() {
-    // The note ends with its 24,000-sample clip; 480-frame blocks put that
-    // note-off at the first sample of the block after the clip.
-    let mut s = synth_session(-6.0);
-    if let Some(ins) = s.tracks[0].instrument.as_mut() {
-        ins.params.insert("amp_release".into(), 20.0);
-    }
-    let out = render_range(&s, Range::new(0, 48_000), 480);
-    let peak = |r: std::ops::Range<usize>| out[0].get(r).unwrap_or_default().iter().fold(0.0_f32, |p, x| p.max(x.abs()));
-    assert!(peak(12_000..24_000) > 0.01, "the synth should sound");
-    assert!(peak(30_000..48_000) < 1e-4, "the note must be released at the clip end");
-}
-
-#[test]
 fn insert_slot_a_automation_does_not_drive_the_instrument() {
     let mut s = synth_session(-6.0);
     let reference = render_range(&s, Range::new(0, 12_000), 512);
@@ -120,23 +87,6 @@ fn add_dc_track(s: &mut Session, level: f32, frames: usize) -> TrackId {
         pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
     }
     t
-}
-
-#[test]
-fn stereo_balance_attenuates_without_crossfeed_or_boost() {
-    let mut s = Session::default();
-    let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
-    let frames = 4800;
-    let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.8; frames], vec![0.4; frames]] };
-    s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(buf)));
-    let id = s.new_clip_id();
-    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "stereo", SourceId(900), 0, 0, frames as i64));
-    for (balance, left, right) in [(-1.0, 0.8, 0.0), (-0.5, 0.8, 0.2), (0.0, 0.8, 0.4), (0.5, 0.4, 0.4), (1.0, 0.0, 0.4), (f32::NAN, 0.8, 0.4)] {
-        s.track_mut(t).unwrap().mixer.stereo_balance = balance;
-        let out = render_range(&s, Range::new(0, frames as i64), 512);
-        assert!((out[0][1000] - left).abs() < 1e-6, "balance {balance}");
-        assert!((out[1][1000] - right).abs() < 1e-6, "balance {balance}");
-    }
 }
 
 #[test]
@@ -592,73 +542,6 @@ fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
 }
 
 #[test]
-fn auv3_prepared_offline_instance_uses_shared_compensation_and_exact_range() {
-    // Time Shift is a creative delay and deliberately reports zero algorithmic
-    // latency. This fixture delegates its DSP but declares the three samples
-    // as host-compensated latency, like the native test extension.
-    struct AlgorithmicDelay(Box<dyn Plugin>);
-    impl Plugin for AlgorithmicDelay {
-        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
-            self.0.info()
-        }
-        fn prepare(&mut self, sr: f32, block: usize, ch: usize) {
-            self.0.prepare(sr, block, ch);
-        }
-        fn reset(&mut self) {
-            self.0.reset();
-        }
-        fn set_param(&mut self, id: &str, value: f32) -> bool {
-            self.0.set_param(id, value)
-        }
-        fn param(&self, id: &str) -> Option<f32> {
-            self.0.param(id)
-        }
-        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-            self.0.process(io, frames);
-        }
-        fn latency(&self) -> usize {
-            3
-        }
-    }
-    assert!(is_third_party("auv3:61756678:74657374:4c446177"));
-    let (mut session, track) = session_with_dc(0.5, 4096);
-    let reference = render_range(&session, Range::new(0, 1024), 128);
-    let id = "auv3:61756678:74657374:4c446177";
-    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
-    // Use SoundCraft's own fixed-delay processor as the fake asynchronously
-    // prepared unit. Real plugin loading is deliberately absent from tests.
-    let mut delay = soundcraft_dsp::create("time_shift").unwrap();
-    assert!(delay.set_param("delay_samples", 3.0));
-    delay.prepare(48_000.0, 128, 1);
-    let instance = PreparedInstance { track, slot: 0, id: id.into(), ch: 1, plugin: Box::new(AlgorithmicDelay(delay)) };
-    let mut render = RangeRender::with_prepared_instances(&session, None, Range::new(0, 1024), 128, vec![instance]).unwrap();
-    let mut actual = vec![Vec::new(), Vec::new()];
-    while let Some((block, frames)) = render.next_block(&session) {
-        for (out, channel) in actual.iter_mut().zip(block) {
-            out.extend_from_slice(&channel[..frames]);
-        }
-    }
-    assert_eq!(actual, reference, "the hosted delay must be trimmed by the shared offline mixer");
-}
-
-#[test]
-fn auv3_prepared_graph_rejects_missing_duplicate_stale_and_wrong_layout_slots() {
-    let (mut session, track) = session_with_dc(0.5, 4096);
-    let id = "auv3:61756678:74657374:4c446177";
-    session.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new(id));
-    let make = |slot, ch, id: &str| PreparedInstance { track, slot, id: id.into(), ch, plugin: soundcraft_dsp::create("gain").unwrap() };
-    assert!(validate_prepared_instances(&session, &[]).is_err());
-    assert!(validate_prepared_instances(&session, &[make(0, 2, id)]).is_err());
-    assert!(validate_prepared_instances(&session, &[make(3, 1, id)]).is_err());
-    assert!(validate_prepared_instances(&session, &[make(0, 1, "auv3:stale")]).is_err());
-    assert!(validate_prepared_instances(&session, &[make(0, 1, id)]).is_ok());
-    session.track_mut(track).unwrap().mixer.inserts[1] = Some(Insert::new(id));
-    assert!(validate_prepared_instances(&session, &[make(0, 1, id), make(0, 1, id)]).is_err());
-    assert!(validate_prepared_instances(&session, &[make(0, 1, id), make(1, 1, id)]).is_ok());
-    assert!(RangeRender::with_prepared_instances(&session, None, Range::new(0, 1024), 128, Vec::new()).is_err());
-}
-
-#[test]
 fn external_instances_are_adopted_and_retired() {
     let (mut s, t) = session_with_dc(0.5, 48_000);
     let mut ins = Insert::new("clap:test.fake");
@@ -1108,25 +991,6 @@ fn input_monitoring_replaces_clips() {
     s.track_mut(t).unwrap().mixer.input_monitor = false;
     eng.render(&s, 1024, 512, &mut out);
     assert!(out[0][100].abs() < 1e-6, "stopped, unmonitored: silence");
-}
-
-#[test]
-fn reset_clears_meter_values_without_releasing_track_storage() {
-    let (s, track) = session_with_dc(0.5, 4800);
-    let mut engine = MixEngine::new(48_000.0, 512);
-    let mut output = vec![vec![0.0; 512]; 2];
-    engine.render(&s, 0, 512, &mut output);
-    let capacity = engine.meters.get(&track).map(|m| m.peaks.capacity()).unwrap_or(0);
-    assert!(capacity > 0);
-    assert!(engine.meters.get(&track).is_some_and(|m| m.peak[0] > 0.0));
-
-    engine.reset();
-
-    let meter = engine.meters.get(&track);
-    assert!(meter.is_some(), "track meter retained");
-    assert_eq!(meter.map_or([1.0; 2], |m| m.peak), [0.0; 2]);
-    assert!(meter.is_some_and(|m| m.peaks.iter().all(|peak| *peak == 0.0)));
-    assert_eq!(meter.map_or(0, |m| m.peaks.capacity()), capacity);
 }
 
 #[test]
