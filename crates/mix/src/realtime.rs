@@ -142,7 +142,7 @@ fn transfer_slot(next: &mut Option<PluginSlot>, old: &mut Option<PluginSlot>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_audio_io::AudioBuffer;
+    use craft_audio::AudioBuffer;
     use soundcraft_dsp::Plugin;
     use soundcraft_model::{ChannelFormat, Clip, Insert, SourceAudio, SourceId, TrackId};
 

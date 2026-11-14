@@ -145,7 +145,7 @@ fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, super::Sender<Cmd
     let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
     let mut x = vec![0.01f32; 48_000];
     x[spike_at..spike_at + 32].fill(0.9);
-    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![x] })));
+    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![x] })));
     let id = s.new_clip_id();
     s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 48_000));
     let shared = Arc::new(Shared {
@@ -648,7 +648,7 @@ fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec
     s.outputs[0].format = format;
     let t = s.add_track(TrackKind::Audio, format, None);
     let frames = channels[0].len();
-    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels })));
+    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels })));
     let id = s.new_clip_id();
     s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "output", SourceId(5), 0, 0, frames as i64));
     let shared = Arc::new(Shared {
@@ -838,7 +838,7 @@ fn surround_main_maps_to_device_channels_or_folds_down() {
     s.outputs[0].format = ChannelFormat::Surround51;
     let t = s.add_track(TrackKind::Audio, ChannelFormat::Surround51, None);
     let chans: Vec<Vec<f32>> = (0..6).map(|c| vec![0.1 * (c + 1) as f32; 48_000]).collect();
-    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: chans })));
+    s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: chans })));
     let id = s.new_clip_id();
     s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 48_000));
     let s = Arc::new(s);
@@ -1106,10 +1106,7 @@ fn locate_while_playing_drops_the_old_position_audio() {
         let mut s = soundcraft_model::Session::default();
         s.edit.click = false;
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-        s.pool.insert(
-            SourceId(5),
-            Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 4800]] })),
-        );
+        s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 4800]] })));
         let id = s.new_clip_id();
         let tr = s.track_mut(t).unwrap();
         tr.playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 4800));
@@ -1196,7 +1193,7 @@ fn mobile_session_handoff_uses_the_prepared_box_and_preserves_the_live_tail() {
     session.edit.click = false;
     let vocal = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
     let signal = (0..24_000).map(|n| if n < 512 { (n as f32 * 0.21).sin() * 0.4 } else { 0.0 }).collect();
-    session.pool.insert(SourceId(1), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+    session.pool.insert(SourceId(1), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
     let clip = session.new_clip_id();
     session.track_mut(vocal).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip, "take", SourceId(1), 0, 0, 24_000));
     let mut reverb = Insert::new("room_reverb");
@@ -1372,7 +1369,7 @@ fn mobile_latency_automation_does_not_allocate_or_free_in_the_callback() {
     session.edit.click = false;
     let source = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
     let signal = (0..4096).map(|n| (n as f32 * 0.13).sin() * 0.2).collect();
-    session.pool.insert(SourceId(1), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+    session.pool.insert(SourceId(1), Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
     let clip = session.new_clip_id();
     session.track_mut(source).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip, "signal", SourceId(1), 0, 0, 4096));
     let latent = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
@@ -1474,7 +1471,7 @@ fn mobile_five_track_vocal_workload_has_no_callback_allocations_or_frees() {
             let signal: Vec<f32> = (0..frames * CALLBACKS).map(|n| (n as f32 * (0.017 + index as f32 * 0.009)).sin() * 0.03).collect();
             session.pool.insert(
                 source,
-                Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal; format.channels()] })),
+                Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![signal; format.channels()] })),
             );
             let clip_id = session.new_clip_id();
             let track = session.track_mut(track_id).unwrap();
@@ -1574,7 +1571,7 @@ fn three_playing_tracks_with_dm_off_skip_monitor_rack_and_feedback_without_alloc
         let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         let source = SourceId(session.alloc());
         let signal = (0..FRAMES * BLOCKS).map(|i| (i as f32 * (0.03 + index as f32 * 0.01)).sin() * 0.1).collect();
-        session.pool.insert(source, Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
+        session.pool.insert(source, Arc::new(SourceAudio::new(craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![signal] })));
         let clip_id = session.new_clip_id();
         session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip_id, "playing", source, 0, 0, (FRAMES * BLOCKS) as i64));
     }

@@ -1,11 +1,11 @@
 //! The session: the whole document.
 
 use crate::clip::{bound, bound_sequence};
+use crate::soundcraft_time::{FrameRate, GridScale, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 use crate::{
     Bus, BusId, ChannelFormat, Clip, ClipId, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
     TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
 };
-use soundcraft_time::{FrameRate, GridScale, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
 /// Native session file extension.
 pub const SESSION_EXTENSION: &str = "scraft";
@@ -348,6 +348,7 @@ impl AutoName {
 pub struct Session {
     pub format_version: u32,
     pub name: String,
+    #[serde(deserialize_with = "sample_rate_or_default")]
     pub sample_rate: SampleRate,
     pub bit_depth: BitDepthSetting,
     pub frame_rate: FrameRate,
@@ -376,12 +377,23 @@ pub struct Session {
     /// Original MIDI performances keyed by clip id (Event › MIDI Operations › Restore/Flatten
     /// Performance). Independent of undo so a restore survives later edits.
     #[serde(default)]
-    pub midi_originals: std::collections::BTreeMap<u64, soundcraft_midi::Sequence>,
+    pub midi_originals: std::collections::BTreeMap<u64, crate::soundcraft_midi::Sequence>,
     #[serde(skip)]
     pub pool: SourcePool,
     /// The folder relative source paths point into: where the session was opened or last saved.
     #[serde(skip)]
     pub folder: Option<std::path::PathBuf>,
+}
+
+/// Older SoundCraft builds repaired an in-range but invalid sample rate after reading a session.
+/// `craft-time` validates `SampleRate` during serde, so keep that file compatibility at this
+/// domain boundary while retaining strict serde validation for direct `SampleRate` use.
+fn sample_rate_or_default<'de, D>(deserializer: D) -> Result<SampleRate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let hz = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(SampleRate::new(hz).unwrap_or_default())
 }
 
 impl Default for Session {
@@ -496,12 +508,28 @@ impl Session {
 
     /// Format a position against this session's timecode and feet+frames references.
     pub fn format_position(&self, at: Samples, fmt: TimeFormat) -> String {
-        soundcraft_time::format_position(at, fmt, self.sample_rate, &self.tempo, self.frame_rate, self.timecode_start, self.feet_frames_start())
+        crate::soundcraft_time::format_position(
+            at,
+            fmt,
+            self.sample_rate,
+            &self.tempo,
+            self.frame_rate,
+            self.timecode_start,
+            self.feet_frames_start(),
+        )
     }
 
     /// Parse a position typed in `fmt` against this session's references.
-    pub fn parse_position(&self, text: &str, fmt: TimeFormat) -> Result<Samples, soundcraft_time::TimeError> {
-        soundcraft_time::parse_position(text, fmt, self.sample_rate, &self.tempo, self.frame_rate, self.timecode_start, self.feet_frames_start())
+    pub fn parse_position(&self, text: &str, fmt: TimeFormat) -> Result<Samples, crate::soundcraft_time::TimeError> {
+        crate::soundcraft_time::parse_position(
+            text,
+            fmt,
+            self.sample_rate,
+            &self.tempo,
+            self.frame_rate,
+            self.timecode_start,
+            self.feet_frames_start(),
+        )
     }
 
     /// Whether the Edit window shows a track: unhidden, with every parent folder open.
@@ -936,11 +964,11 @@ mod tests {
     fn clips_markers_grid_uses_visible_clip_edges_and_memory_locations() {
         let mut s = Session::default();
         let track = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
-        let clip = Clip::midi(s.new_clip_id(), "Notes", 1_000, 2_000, soundcraft_midi::Sequence::default());
+        let clip = Clip::midi(s.new_clip_id(), "Notes", 1_000, 2_000, crate::soundcraft_midi::Sequence::default());
         let clip_id = clip.id;
         s.track_mut(track).and_then(Track::playlist_mut).unwrap().clips.push(clip);
         let hidden = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
-        let hidden_clip = Clip::midi(s.new_clip_id(), "Hidden", 3_200, 100, soundcraft_midi::Sequence::default());
+        let hidden_clip = Clip::midi(s.new_clip_id(), "Hidden", 3_200, 100, crate::soundcraft_midi::Sequence::default());
         if let Some(track) = s.track_mut(hidden) {
             track.hidden = true;
             track.playlist_mut().unwrap().clips.push(hidden_clip);
@@ -970,7 +998,7 @@ mod tests {
         let outer = s.add_track(TrackKind::Folder, ChannelFormat::Stereo, None);
         let inner = s.add_track(TrackKind::Folder, ChannelFormat::Stereo, None);
         let child = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
-        let clip = Clip::midi(s.new_clip_id(), "Visible", 1_000, 2_000, soundcraft_midi::Sequence::default());
+        let clip = Clip::midi(s.new_clip_id(), "Visible", 1_000, 2_000, crate::soundcraft_midi::Sequence::default());
         s.track_mut(inner).unwrap().folder = Some(outer);
         s.track_mut(inner).unwrap().hidden = true;
         s.track_mut(child).unwrap().folder = Some(inner);
@@ -1006,11 +1034,11 @@ mod tests {
     #[test]
     fn frame_grids_apply_session_counter_origins() {
         let mut s = Session { sample_rate: SampleRate::HZ_48000, frame_rate: FrameRate::Fps30, timecode_start: 1_600, ..Session::default() };
-        s.edit.grid = GridValue::Timecode(soundcraft_time::TimecodeValue::Second);
+        s.edit.grid = GridValue::Timecode(crate::soundcraft_time::TimecodeValue::Second);
         assert_eq!(s.grid_line_at_or_before(47_000), 46_400);
         assert_eq!(s.snap_to_grid(46_400), 46_400);
 
-        s.edit.grid = GridValue::FeetFrames(soundcraft_time::FeetFramesValue::Foot);
+        s.edit.grid = GridValue::FeetFrames(crate::soundcraft_time::FeetFramesValue::Foot);
         s.edit.values.insert(FEET_FRAMES_START.into(), 1.0);
         assert_eq!(s.grid_line_at_or_before(25_000), 24_000);
         assert_eq!(s.snap_to_grid(24_000), 24_000);
@@ -1019,7 +1047,7 @@ mod tests {
     /// Every Feet+Frames increment shares the parser's single rounding at fractional frame rates.
     #[test]
     fn feet_frames_grid_matches_parsed_positions_with_signed_frame_origins() {
-        use soundcraft_time::FeetFramesValue;
+        use crate::soundcraft_time::FeetFramesValue;
         for rate in [FrameRate::Fps23_976, FrameRate::Fps29_97, FrameRate::Fps29_97Drop, FrameRate::Fps59_94Drop] {
             let mut s = Session { sample_rate: SampleRate::HZ_48000, frame_rate: rate, ..Session::default() };
             for origin in [-17, -1, 1, 17] {
@@ -1050,7 +1078,7 @@ mod tests {
                 let sr = SampleRate::HZ_48000;
                 let origin = rate.samples_at_frame(origin_frame, sr);
                 let mut s = Session { sample_rate: sr, frame_rate: rate, timecode_start: origin, ..Session::default() };
-                s.edit.grid = GridValue::Timecode(soundcraft_time::TimecodeValue::Second);
+                s.edit.grid = GridValue::Timecode(crate::soundcraft_time::TimecodeValue::Second);
                 for boundary in [-minute_frame, minute_frame] {
                     let at = rate.samples_at_frame(boundary, sr) - origin;
                     assert_eq!(s.grid_line_at_or_before(at), at, "{rate:?}, origin {origin_frame}");

@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-model"
-description = "SoundCraft session document: tracks, playlists, clips, mixer, routing, automation, markers"
+description = "SoundCraft session document with mobile stereo output balance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,16 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-soundcraft-time.workspace = true
-soundcraft-audio-io.workspace = true
-soundcraft-midi.workspace = true
+craft-audio = { workspace = true, features = ["lossless-encode", "peaks"] }
+craft-midi = { workspace = true, features = ["serde"] }
+craft-time.workspace = true
+craft-zip.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+craft-audio = { workspace = true, features = ["decode", "serde"] }
 proptest.workspace = true
 
 [lints]

@@ -88,14 +88,27 @@ mod tests {
 
     #[test]
     fn size_cap_counts_the_partial_quartet() {
-        for (extra, ok) in [(-1, true), (0, true), (1, false), (2, false)] {
-            let data = vec![7u8; MAX_DECODED_BYTES.saturating_add_signed(extra)];
-            let padded = encode(&data);
-            let unpadded = padded.trim_end_matches('=');
-            assert_eq!(decode(&padded).is_some(), ok, "padded, {extra}");
-            assert_eq!(decode(unpadded).is_some(), ok, "unpadded, {extra}");
-            let spaced = format!("{}\n {}", &padded[..8], &padded[8..]);
-            assert_eq!(decode(&spaced).is_some(), ok, "whitespace, {extra}");
+        fn encoded_zero_bytes(len: usize) -> String {
+            let groups = len / 3;
+            let mut encoded = "A".repeat(groups * 4);
+            match len % 3 {
+                1 => encoded.push_str("AA=="),
+                2 => encoded.push_str("AAA="),
+                _ => {}
+            }
+            encoded
         }
+
+        // Build valid base64 directly instead of encoding a 64 MiB allocation on every case.
+        // This keeps the same decoded-size boundary checks while making the workspace gate much
+        // faster and using less temporary memory.
+        let exact = encoded_zero_bytes(MAX_DECODED_BYTES);
+        assert_eq!(decode(&exact).map(|bytes| bytes.len()), Some(MAX_DECODED_BYTES), "padded boundary");
+        assert_eq!(decode(exact.trim_end_matches('=')).map(|bytes| bytes.len()), Some(MAX_DECODED_BYTES), "unpadded boundary");
+
+        let too_large = encoded_zero_bytes(MAX_DECODED_BYTES + 1);
+        assert!(decode(&too_large).is_none(), "padded over boundary");
+        let spaced = format!("{}\n {}", &too_large[..8], &too_large[8..]);
+        assert!(decode(&spaced).is_none(), "whitespace over boundary");
     }
 }

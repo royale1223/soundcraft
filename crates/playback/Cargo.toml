@@ -15,7 +15,7 @@ asio = ["cpal/asio"]
 
 [dependencies]
 soundcraft-time.workspace = true
-soundcraft-audio-io.workspace = true
+craft-audio.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix = { path = "../mix", default-features = false }
 soundcraft-dsp.workspace = true
