@@ -117,6 +117,24 @@ fn fader_mute_and_solo() {
 }
 
 #[test]
+fn live_fader_moves_the_playing_strip_without_changing_the_session() {
+    let (s, track) = session_with_dc(0.5, 4_800);
+    let live = Arc::new(LiveFaders::default());
+    let mut mix = MixEngine::new(48_000.0, 512);
+    mix.set_live_faders(Arc::clone(&live));
+    let mut out = vec![vec![0.0; 512]; 2];
+    mix.render(&s, 0, 512, &mut out);
+    let base = out[0][511];
+    assert!(live.set(track, Some(-12.0)));
+    mix.render(&s, 512, 512, &mut out);
+    assert!((out[0][0] - base).abs() < 1e-3, "first sample ramps from the old level");
+    assert!((out[0][511] - base * db_to_gain(-12.0)).abs() < 1e-3);
+    mix.render(&s, 1024, 512, &mut out);
+    assert!((out[0][0] - base * db_to_gain(-12.0)).abs() < 1e-3);
+    assert_eq!(s.track(track).unwrap().mixer.volume_db, 0.0);
+}
+
+#[test]
 fn hard_pans() {
     let (mut s, t) = session_with_dc(0.5, 4800);
     s.track_mut(t).unwrap().mixer.pan = vec![-1.0];

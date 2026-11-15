@@ -47,6 +47,7 @@ pub(crate) struct Strip {
     pub(crate) muted: bool,
     pub(crate) gr: f32,
     pub(crate) monitor_gain: Option<f32>,
+    pub(crate) live_fader_db: Option<f32>,
     pub(crate) monitored: bool,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     pub(crate) clip_fx: HashMap<u64, ClipFx>,
@@ -157,6 +158,7 @@ impl Strip {
             muted: false,
             gr: 0.0,
             monitor_gain: None,
+            live_fader_db: None,
             monitored: false,
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
@@ -226,6 +228,7 @@ impl SlotCtx<'_> {
 /// Source → trim → inserts → (pre-fader copy) → mute/fader for one strip. Independent of other
 /// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
 /// Live input routed to monitored tracks.
+#[derive(Clone, Copy)]
 pub(crate) struct LiveInput<'a> {
     pub(crate) gain: f32,
     pub(crate) use_rack: bool,
@@ -233,6 +236,7 @@ pub(crate) struct LiveInput<'a> {
     pub(crate) monitor_only: bool,
     pub(crate) recording: bool,
     pub(crate) live_midi_track: Option<TrackId>,
+    pub(crate) fader_db: Option<f32>,
 }
 
 /// The block being rendered: where it starts, its length, and whether any track is soloed.
@@ -391,7 +395,7 @@ fn run_inserts(t: &Track, strip: &mut Strip, blk: Block, transport: &Transport, 
 
 /// Fader gain (volume, trim and VCA automation), read at every sample of the block. A monitored
 /// input also takes the listening gain `monitor_gain`, ramped from the previous block's value.
-fn apply_fader(s: &Session, t: &Track, strip: &mut Strip, blk: Block, monitor_gain: f32) {
+fn apply_fader(s: &Session, t: &Track, strip: &mut Strip, blk: Block, monitor_gain: f32, live_fader_db: Option<f32>) {
     let Block { pos, frames, .. } = blk;
     // Trim automation (an offset on top of the volume curve).
     let trim = t
@@ -410,7 +414,22 @@ fn apply_fader(s: &Session, t: &Track, strip: &mut Strip, blk: Block, monitor_ga
             strip.muted = true;
         }
     }
-    let levels = if strip.muted { [Level::Fixed(-144.0), Level::Fixed(0.0), Level::Fixed(0.0)] } else { [volume_level(t), trim, vca_level] };
+    let volume = volume_level(t);
+    let ramp_end = pos.saturating_add(frames.saturating_sub(1) as Samples);
+    let fader = if let Some(db) = live_fader_db {
+        let start = strip.live_fader_db.unwrap_or_else(|| volume.at(pos));
+        strip.live_fader_db = Some(db);
+        Level::Ramp { from: pos, to: ramp_end, start, end: db }
+    } else if let Some(start) = strip.live_fader_db.take() {
+        Level::Ramp { from: pos, to: ramp_end, start, end: volume.at(ramp_end) }
+    } else {
+        volume
+    };
+    let levels = if strip.muted {
+        [Level::Fixed(-144.0), Level::Fixed(0.0), Level::Fixed(0.0)]
+    } else {
+        [fader, trim, vca_level]
+    };
     apply_gain(&levels, pos, frames, 12.0, &mut strip.buf);
     // The listening gain rides on top of the fader, ramped so a live gain change never steps.
     let monitored = strip.monitored;
@@ -484,7 +503,7 @@ pub(crate) fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &
             d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
         }
     }
-    apply_fader(s, t, strip, blk, live.gain);
+    apply_fader(s, t, strip, blk, live.gain, live.fader_db);
     gate_mute_automation(t, strip, blk);
 }
 

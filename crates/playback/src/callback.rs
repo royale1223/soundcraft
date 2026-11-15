@@ -245,6 +245,7 @@ impl AudioState {
         // starts invoking this state. The output workspace covers every supported main layout so
         // later format changes only alter its active channel count.
         let mut mix = Box::new(new_engine(sr));
+        mix.set_live_faders(Arc::clone(&shared.live_faders));
         #[cfg(feature = "plugin-hosts")]
         mix.ensure_synced(&session);
         #[cfg(not(feature = "plugin-hosts"))]
@@ -357,6 +358,7 @@ impl AudioState {
                     #[cfg(not(feature = "plugin-hosts"))]
                     let retired_mix = {
                         let mut prepared = instances;
+                        prepared.set_live_faders(Arc::clone(&self.shared.live_faders));
                         prepared.inherit_runtime(&mut self.mix);
                         Some(std::mem::replace(&mut self.mix, prepared))
                     };

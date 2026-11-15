@@ -62,10 +62,12 @@ use soundcraft_model::{
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::Arc;
 
 mod automation;
 mod clips;
 mod instances;
+mod live_faders;
 mod meter;
 mod midi;
 mod offline;
@@ -80,6 +82,7 @@ pub use instances::{
     INSTRUMENT_SLOT, InstanceSpec, NewInstance, PluginFailures, PreparedInstance, create_instance, instance_specs, is_third_party,
     validate_prepared_instances,
 };
+pub use live_faders::LiveFaders;
 pub use meter::StripMeter;
 use midi::sync_sample;
 pub use offline::{
@@ -128,6 +131,7 @@ pub struct MixEngine {
     main_fmt: ChannelFormat,
     pub meters: HashMap<TrackId, StripMeter>,
     pub main_meter: StripMeter,
+    live_faders: Option<Arc<LiveFaders>>,
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
     last_end: Samples,
@@ -192,6 +196,7 @@ impl MixEngine {
             main_fmt: ChannelFormat::Stereo,
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
+            live_faders: None,
             pan_law: PanLaw::Minus3,
             last_end: 0,
             synced: (0, 0, 0),
@@ -216,6 +221,11 @@ impl MixEngine {
             retired: Vec::new(),
             work: Vec::new(),
         }
+    }
+
+    /// Install a control-thread-created override table before realtime rendering.
+    pub fn set_live_faders(&mut self, faders: Arc<LiveFaders>) {
+        self.live_faders = Some(faders);
     }
 
     /// Realtime mode: third-party plugins are created by the host and handed over with
@@ -495,10 +505,14 @@ impl MixEngine {
             live_midi_track: self.live_midi_track,
             gain: self.monitor_gain,
             use_rack: self.monitor_use_rack,
+            fader_db: None,
         };
+        let faders = self.live_faders.as_deref();
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
-                process_strip(s, t, st, &busses, &live_in, blk);
+                let mut live = live_in;
+                live.fader_db = faders.and_then(|f| f.get(t.id));
+                process_strip(s, t, st, &busses, &live, blk);
             }
         });
         self.busses = busses;
@@ -627,6 +641,7 @@ impl MixEngine {
                 live_midi_track: self.live_midi_track,
                 gain: self.monitor_gain,
                 use_rack: self.monitor_use_rack,
+                fader_db: self.live_faders.as_ref().and_then(|f| f.get(t.id)),
             };
             process_strip(s, t, &mut st, &self.busses, &live_in, blk);
             let ch = st.buf.len();

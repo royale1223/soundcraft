@@ -244,6 +244,7 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     monitor_gain: AtomicU32,
+    live_faders: Arc<soundcraft_mix::LiveFaders>,
     monitor_use_rack: AtomicBool,
     direct_monitor_enabled: AtomicBool,
     feedback_protection: AtomicBool,
@@ -348,6 +349,7 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            live_faders: Arc::new(soundcraft_mix::LiveFaders::default()),
             monitor_use_rack: AtomicBool::new(true),
             direct_monitor_enabled: AtomicBool::new(true),
             feedback_protection: AtomicBool::new(false),
@@ -645,6 +647,12 @@ impl Player {
     pub fn set_monitor_gain(&self, gain: f32) {
         let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 0.0 };
         self.shared.monitor_gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Preview a track fader without a session rebuild or an audio command.
+    /// `None` releases the override after the document has committed the value.
+    pub fn set_live_fader(&self, track: TrackId, db: Option<f32>) -> bool {
+        self.shared.live_faders.set(track, db)
     }
 
     /// Include the track's inserts in live input monitoring (false is a dry listen).
