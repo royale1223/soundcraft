@@ -72,6 +72,8 @@ impl MixEngine {
         std::mem::swap(&mut self.input, &mut previous.input);
         for (id, strip) in &mut self.strips {
             let Some(old) = previous.strips.get_mut(id) else { continue };
+            // A fader moved by this session change ramps from the level the live strip played.
+            strip.fader_db = old.fader_db;
             for (slot, (next, old)) in strip.plugins.iter_mut().zip(&mut old.plugins).enumerate() {
                 if !self.fresh_external.contains(&(*id, slot)) {
                     transfer_slot(next, old);
